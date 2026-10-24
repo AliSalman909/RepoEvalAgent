@@ -8,52 +8,102 @@ Google's official Gen AI SDK (`google-genai`), used for plain `models.generate_c
 automatic function calling turned off. No LangChain, LangGraph, n8n or other agent framework is used. The Gemini
 model defaults to `gemini-flash-lite-latest` and can be changed with `GEMINI_MODEL` in `.env` (or `--model`).
 
+The only executable entry point is **`agent.py`**. After one-time setup, an evaluator runs the complete agent with:
+
 ```bash
-python agent.py --repo https://github.com/owner/repo --output report.json
+python agent.py --repo https://github.com/owner/repository --output report.json
 ```
+
+The other Python files are imported automatically by `agent.py`; they are not run separately.
 
 ---
 
-## 1. Installation
+## 1. Quick setup
 
 Requirements: Python 3.10+ and `git` on `PATH`.
+
+### Windows PowerShell
+
+Activation is not required—the commands call the virtual environment's Python directly.
+
+```powershell
+git clone <this repository>
+cd <this repository>
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+Open `.env`, put the Gemini API key after `GEMINI_API_KEY=`, and run:
+
+```powershell
+.\.venv\Scripts\python.exe agent.py --repo https://github.com/owner/repository --output report.json
+```
+
+### Linux or macOS
 
 ```bash
 git clone <this repository>
 cd <this repository>
-
-python -m venv .venv
-# Windows:      .venv\Scripts\activate
-# Linux/macOS:  source .venv/bin/activate
-
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-## 2. Configuration
+Open `.env`, put the Gemini API key after `GEMINI_API_KEY=`, and run:
 
 ```bash
-cp .env.example .env        # Windows: copy .env.example .env
-# then edit .env and set GEMINI_API_KEY=... (https://aistudio.google.com/apikey)
+.venv/bin/python agent.py --repo https://github.com/owner/repository --output report.json
 ```
+
+If the virtual environment is activated, the shorter assignment command works on every platform:
+
+```bash
+python agent.py --repo https://github.com/owner/repository --output report.json
+```
+
+## 2. Environment configuration
+
+### Why `.env.example` exists
+
+`.env.example` is a safe, committed template showing every supported environment variable and its recommended
+default. It deliberately contains no real credential. Copy it to `.env`, then add the API key to the copy:
+
+```dotenv
+GEMINI_API_KEY=replace-with-your-key
+GEMINI_MODEL=gemini-flash-lite-latest
+GEMINI_REQUESTS_PER_MINUTE=10
+```
+
+The agent loads `.env` automatically through `python-dotenv`; there is no need to export or source it manually.
+`.env` is excluded by `.gitignore` because it contains the private API key. Never put a real key in `.env.example`,
+commit `.env`, or include a key in screenshots, reports, or trace files. A Gemini API key can be created in
+[Google AI Studio](https://aistudio.google.com/apikey).
+
+If `.env` already exists, edit it directly instead of copying `.env.example` over it.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `GEMINI_API_KEY` | yes | - | Gemini API key (`GOOGLE_API_KEY` is also accepted) |
-| `GEMINI_MODEL` | no | `gemini-flash-lite-latest` | Gemini model id (`--model` overrides it) |
-| `GEMINI_REQUESTS_PER_MINUTE` | no | `10` | Maximum top-level Gemini calls per minute; calls are evenly spaced |
+| `GEMINI_API_KEY` | yes | - | Private Gemini API key. `GOOGLE_API_KEY` is also accepted |
+| `GEMINI_MODEL` | no | `gemini-flash-lite-latest` | Gemini model used for the audit; `--model` overrides it for one run |
+| `GEMINI_REQUESTS_PER_MINUTE` | no | `10` | Maximum top-level Gemini calls per minute; calls are evenly spaced to avoid bursts |
 | `GEMINI_THINKING_LEVEL` | no | unset | `minimal` / `low` / `medium` / `high`; only sent when set. Supported levels differ per model (e.g. `gemini-3.8-flash` rejects `minimal`) |
 | `AGENT_MAX_STEPS` | no | `45` | Investigation turn budget |
 | `AGENT_TIMEOUT` | no | `1800` | Overall wall-clock budget (seconds) |
 
-Variables can also be exported in the shell instead of using `.env`.
+Shell environment variables are also supported and take precedence over values loaded from `.env`.
 
 ## 3. Running
 
 ```bash
-python agent.py --repo https://github.com/owner/repo --output report.json
+python agent.py --repo https://github.com/owner/repository --output report.json
 ```
 
-The run is fully unattended. Progress (each tool call the agent makes) is printed to stderr. Outputs:
+`--repo` must be a public GitHub repository URL. The run is fully unattended: after the command starts, the agent
+clones the target, investigates it, verifies candidate findings, writes its outputs, and removes the temporary clone.
+Progress (including each selected tool) is printed to stderr.
+
+Outputs:
 
 - `report.json` is the report (format below). It is always written on a completed inspection, with an empty
   `violations` array if nothing was found.
@@ -75,6 +125,26 @@ Other options:
 
 `--repo` also accepts a path to a local git repository, which is useful for offline testing. Local repos are cloned
 too, so the original is never touched.
+
+### Generate the required sample report
+
+After configuring the API key, create an authentic sample by running the real agent against a public repository:
+
+```bash
+python agent.py --repo https://github.com/owner/repository --output sample_report.json
+```
+
+Review the result, then commit `sample_report.json` with the submission. Do not substitute a manually written JSON
+file. The generated `sample_report.trace.jsonl` is useful for debugging but is ignored by Git and does not need to be
+submitted.
+
+### Common setup problems
+
+- `error: no Gemini API key found`: add the key to `.env` after `GEMINI_API_KEY=`.
+- Exit code 3: confirm the repository URL is correct and publicly accessible.
+- Exit code 4: check the API key, model name, and that `GEMINI_REQUESTS_PER_MINUTE` is a positive number.
+- A run may take several minutes because the default request limiter permits 10 Gemini calls per minute. Increase the
+  value only if the API account's quota supports it.
 
 ### Exit codes
 
@@ -120,7 +190,7 @@ remaining temporary path instead of replacing the audit result with a traceback.
 - `file`/`line` are `null` for repository-level findings, such as a missing file.
 - The report is validated against this contract before it is written atomically. Secret values never appear.
 
-`sample_report.json` is an authentic output of this agent.
+`sample_report.json`, when included for submission, must be an authentic output generated with the command above.
 
 ---
 
@@ -245,13 +315,13 @@ Coverage:
 - **Finding validation** (`tests/test_findings.py`): bad severity, category, file or line, fabricated evidence,
   duplicates, withdraw and verdicts.
 - **Report** (`tests/test_report.py`): contract validation, empty report, sorting, no secrets.
-- **Gemini client** (`tests/test_llm.py`, offline): tool-schema conversion, function-call parsing, thought-signature
-  preservation, function responses with `id`/`name`, finish-reason mapping (safety, malformed call, max tokens), and
-  API-error mapping.
+- **Gemini client** (`tests/test_llm.py`, offline): default/environment configuration, request limiting, tool-schema
+  conversion, function-call parsing, thought-signature preservation, function responses with `id`/`name`,
+  finish-reason mapping (safety, malformed call, max tokens), and API-error mapping.
 - **Agent loop** (`tests/test_loop.py`): parallel dispatch and call-id matching, error feedback, nudging, step
   and deadline budgets, truncated turns, refusal, follow-up calls that depend on earlier observations, and
   verification semantics.
-- **CLI** (`tests/test_cli.py`): URL validation, exit codes 2/4/5, end-to-end report and trace, empty report, and
+- **CLI** (`tests/test_cli.py`): URL validation, failure exit codes, end-to-end report and trace, empty report, and
   that the repository is unchanged.
 
 CI (`.github/workflows/ci.yml`) runs `ruff check` and `pytest` on Python 3.10, 3.12 and 3.13.
