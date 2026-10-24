@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local configuration and secrets
+.env
+
+# Agent outputs (sample_report.json is committed on purpose)
+report.json
+*.trace.jsonl
+reports/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

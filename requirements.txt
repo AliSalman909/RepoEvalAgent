@@ -1,0 +1,8 @@
+# Runtime
+google-genai>=2.33,<3    # official Google Gen AI SDK for Gemini (plain generate_content only; no agent framework)
+PyYAML>=6.0.1,<7         # parsing GitHub Actions workflows
+python-dotenv>=1.0.0,<2  # loading .env
+ruff>=0.6.0              # static linter used by the run_ruff tool (never executes target code)
+
+# Tests
+pytest>=8.0,<10
