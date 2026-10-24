@@ -7,7 +7,7 @@ Exit codes:
   0  inspection completed, report written (an empty violations array is a valid result)
   2  invalid arguments / repository URL
   3  repository could not be fetched (not found, not public, network, timeout)
-  4  LLM configuration error (missing/invalid GEMINI_API_KEY, GEMINI_MODEL not set or unknown)
+  4  LLM configuration error (missing/invalid GEMINI_API_KEY, invalid request limit, or unknown model)
   5  LLM API failure during the run (after retries)
   6  inspection completed but the report could not be written (e.g. unwritable --output path)
   7  agent stopped before completing investigation or verification (no report written)
@@ -56,7 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", default="report.json", help="Path of the JSON report to write (default: report.json)")
     p.add_argument("--trace", default=None,
                    help="JSONL trace of every LLM turn and tool call (default: <output stem>.trace.jsonl; 'none' disables)")
-    p.add_argument("--model", default=None, help="Gemini model id; overrides $GEMINI_MODEL (one of the two is required)")
+    p.add_argument("--model", default=None,
+                   help="Gemini model id; overrides $GEMINI_MODEL (default: gemini-flash-lite-latest)")
     p.add_argument("--max-steps", type=int, default=int(os.environ.get("AGENT_MAX_STEPS", 45)),
                    help="Maximum LLM turns in the investigation phase (default: 45)")
     p.add_argument("--verify-steps", type=int, default=20, help="Maximum LLM turns in the verification phase (default: 20)")
@@ -111,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             llm = make_llm(args.model)
         except LLMConfigError as exc:
-            return _fail(EXIT_LLM_CONFIG, f"{exc}. Configure GEMINI_API_KEY and GEMINI_MODEL in .env (see .env.example).")
+            return _fail(EXIT_LLM_CONFIG, f"{exc}. Configure GEMINI_API_KEY in .env (see .env.example).")
 
         try:
             tracer = Tracer(trace_path, verbose=not args.quiet)
@@ -131,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         except AuditIncompleteError as exc:
             return _fail(EXIT_INCOMPLETE, str(exc))
         except LLMConfigError as exc:
-            return _fail(EXIT_LLM_CONFIG, f"{exc}. Check GEMINI_API_KEY / GEMINI_MODEL.")
+            return _fail(EXIT_LLM_CONFIG, f"{exc}. Check GEMINI_API_KEY, GEMINI_MODEL, and the request limit.")
         except LLMError as exc:
             return _fail(EXIT_LLM, f"LLM failure, inspection incomplete, no report written: {exc}")
         try:

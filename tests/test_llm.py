@@ -3,7 +3,7 @@
 import pytest
 from google.genai import errors, types
 
-from auditor.llm import GeminiClient, LLMConfigError, LLMError, _map_api_error
+from auditor.llm import DEFAULT_MODEL, GeminiClient, LLMConfigError, LLMError, _map_api_error
 from tools import INSPECTION_TOOL_SCHEMAS
 
 TEST_MODEL = "test-model-from-env"
@@ -40,14 +40,39 @@ def test_missing_key(monkeypatch, client):
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
-def test_missing_model_is_a_config_error(monkeypatch, value):
+def test_missing_model_uses_default(monkeypatch, value):
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     if value is None:
         monkeypatch.delenv("GEMINI_MODEL", raising=False)
     else:
         monkeypatch.setenv("GEMINI_MODEL", value)
-    with pytest.raises(LLMConfigError, match="GEMINI_MODEL is not set"):
+    assert GeminiClient().model == DEFAULT_MODEL
+
+
+@pytest.mark.parametrize("value", ["nope", "0", "-2", "nan", "inf"])
+def test_invalid_request_limit_is_a_config_error(monkeypatch, value):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_REQUESTS_PER_MINUTE", value)
+    with pytest.raises(LLMConfigError, match="REQUESTS_PER_MINUTE"):
         GeminiClient()
+
+
+def test_request_limiter_evenly_spaces_calls(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    now = [100.0]
+    waits = []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    limited = GeminiClient(model="test-model", requests_per_minute=30,
+                           clock=lambda: now[0], sleep=sleep)
+    monkeypatch.setattr(limited._client.models, "generate_content",
+                        lambda **kwargs: _response([types.Part(text="ok")]))
+    limited.complete("s", [{"role": "user", "content": "one"}], INSPECTION_TOOL_SCHEMAS)
+    limited.complete("s", [{"role": "user", "content": "two"}], INSPECTION_TOOL_SCHEMAS)
+    assert waits == [2.0]
 
 
 def test_tool_schemas_convert_to_function_declarations(client):

@@ -6,7 +6,7 @@ writes an evidence-based JSON report with actionable recommendations.
 The agent loop, tool dispatch, and control flow are written from scratch in Python. The only LLM dependency is
 Google's official Gen AI SDK (`google-genai`), used for plain `models.generate_content` calls with the SDK's
 automatic function calling turned off. No LangChain, LangGraph, n8n or other agent framework is used. The Gemini
-model is not hardcoded: it is chosen with `GEMINI_MODEL` in `.env` (or `--model`).
+model defaults to `gemini-flash-lite-latest` and can be changed with `GEMINI_MODEL` in `.env` (or `--model`).
 
 ```bash
 python agent.py --repo https://github.com/owner/repo --output report.json
@@ -33,13 +33,14 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env        # Windows: copy .env.example .env
-# then edit .env and set GEMINI_API_KEY=... (https://aistudio.google.com/apikey) and GEMINI_MODEL=...
+# then edit .env and set GEMINI_API_KEY=... (https://aistudio.google.com/apikey)
 ```
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `GEMINI_API_KEY` | yes | - | Gemini API key (`GOOGLE_API_KEY` is also accepted) |
-| `GEMINI_MODEL` | yes | - | Gemini model id, e.g. `gemini-3.8-flash` or `gemini-3.5-flash-lite` (`--model` overrides it) |
+| `GEMINI_MODEL` | no | `gemini-flash-lite-latest` | Gemini model id (`--model` overrides it) |
+| `GEMINI_REQUESTS_PER_MINUTE` | no | `10` | Maximum top-level Gemini calls per minute; calls are evenly spaced |
 | `GEMINI_THINKING_LEVEL` | no | unset | `minimal` / `low` / `medium` / `high`; only sent when set. Supported levels differ per model (e.g. `gemini-3.8-flash` rejects `minimal`) |
 | `AGENT_MAX_STEPS` | no | `45` | Investigation turn budget |
 | `AGENT_TIMEOUT` | no | `1800` | Overall wall-clock budget (seconds) |
@@ -83,7 +84,7 @@ too, so the original is never touched.
 | 1 | Unexpected internal error (including a missing dependency) |
 | 2 | Invalid arguments, repository URL or trace path |
 | 3 | Repository could not be fetched (not found / not public / network / timeout) |
-| 4 | LLM configuration error (missing or invalid `GEMINI_API_KEY`, `GEMINI_MODEL` not set or unknown) |
+| 4 | LLM configuration error (missing or invalid API key, invalid request limit, or unknown model) |
 | 5 | LLM API failure during the run (after retries, e.g. quota exhausted) or a safety block; no report is written |
 | 6 | Inspection completed but the report could not be written (e.g. unwritable `--output` path) |
 | 7 | Investigation or verification stopped before explicit completion; no report is written |
@@ -223,7 +224,8 @@ The hidden-repository evaluation scores precision as well as recall, so several 
   record and report field, for example `<REDACTED:aws-access-key len=20>`. The model can still see that a credential
   is present. The final report is re-checked and rejected if anything secret-like survives.
 - **Bounded execution.** Timeouts apply to clone (300 s), git commands (60 s), ruff (120 s), LLM requests (300 s, with
-  SDK retries on 408/429/5xx) and the whole run (`--timeout`). Tool exceptions become error results instead of crashes.
+  SDK retries on 408/429/5xx) and the whole run (`--timeout`). Top-level LLM calls are evenly rate-limited to 10 per
+  minute by default. Tool exceptions become error results instead of crashes.
 - **No hardcoded answers.** Nothing in the code or prompts refers to specific repositories.
 
 ## 6. Tests

@@ -16,12 +16,17 @@ exactly as received, which keeps Gemini's thought signatures intact.
 
 from __future__ import annotations
 
+import math
 import os
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-# The model is never hardcoded: it comes from GEMINI_MODEL (or the --model CLI flag).
+# The model can be overridden with GEMINI_MODEL or the --model CLI flag.
+DEFAULT_MODEL = "gemini-flash-lite-latest"
+DEFAULT_REQUESTS_PER_MINUTE = 10.0
 DEFAULT_MAX_OUTPUT_TOKENS = 16384
 
 # Gemini finish reasons, normalised for the loop.
@@ -77,6 +82,9 @@ class GeminiClient:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         timeout_s: float = 300.0,
         retry_attempts: int = 5,
+        requests_per_minute: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         try:
             from google import genai
@@ -88,9 +96,22 @@ class GeminiClient:
         key = _api_key()
         if not key:
             raise LLMConfigError("no Gemini API key found (GEMINI_API_KEY is not set)")
-        self.model = (model or os.environ.get("GEMINI_MODEL") or "").strip()
+        self.model = (model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL).strip()
         if not self.model:
-            raise LLMConfigError("no Gemini model configured (GEMINI_MODEL is not set; e.g. GEMINI_MODEL=gemini-3.8-flash)")
+            self.model = DEFAULT_MODEL
+        raw_rpm = requests_per_minute
+        if raw_rpm is None:
+            raw_rpm = os.environ.get("GEMINI_REQUESTS_PER_MINUTE", str(DEFAULT_REQUESTS_PER_MINUTE))
+        try:
+            self.requests_per_minute = float(raw_rpm)
+        except (TypeError, ValueError):
+            raise LLMConfigError("GEMINI_REQUESTS_PER_MINUTE must be a number greater than zero") from None
+        if not math.isfinite(self.requests_per_minute) or self.requests_per_minute <= 0:
+            raise LLMConfigError("GEMINI_REQUESTS_PER_MINUTE must be greater than zero")
+        self._request_interval_s = 60.0 / self.requests_per_minute
+        self._clock = clock
+        self._sleep = sleep
+        self._last_request_at: float | None = None
         # Thinking level is model-specific (some models reject some levels), so it is only sent when configured.
         level = thinking_level if thinking_level is not None else os.environ.get("GEMINI_THINKING_LEVEL", "")
         self.thinking_level = level.strip().lower() or None
@@ -187,6 +208,16 @@ class GeminiClient:
 
     # -------------------------------------------------------------------- call
 
+    def _wait_for_request_slot(self) -> None:
+        """Evenly space top-level API calls so the configured RPM is never exceeded by this client."""
+        now = self._clock()
+        if self._last_request_at is not None:
+            wait_s = self._request_interval_s - (now - self._last_request_at)
+            if wait_s > 0:
+                self._sleep(wait_s)
+                now = self._clock()
+        self._last_request_at = now
+
     def complete(self, system: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse:
         t, errors = self._types, self._errors
         config = t.GenerateContentConfig(
@@ -198,6 +229,7 @@ class GeminiClient:
             thinking_config=t.ThinkingConfig(thinking_level=self.thinking_level) if self.thinking_level else None,
         )
         try:
+            self._wait_for_request_slot()
             resp = self._client.models.generate_content(
                 model=self.model, contents=self.to_contents(messages), config=config,
             )
