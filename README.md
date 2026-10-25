@@ -247,9 +247,6 @@ wrap up when three turns remain. The conversation is append-only, and Gemini's o
 thought signatures stay valid. Turns cut off by the token limit are not executed. A malformed function call gets a
 "retry with valid arguments" hint. A safety block is surfaced as an error.
 
-There is no fixed checklist in code. The system prompt describes the inspection areas, a rule-id catalog for
-consistent naming, a severity guide, and the evidence rules. What to inspect and in which order is decided by the LLM
-from what it observes.
 
 ### Tools (`tools.py`)
 
