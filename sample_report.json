@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/rehman845/Chronaide",
+  "violations": [
+    {
+      "rule_id": "CI-001",
+      "category": "ci_cd",
+      "severity": "medium",
+      "file": null,
+      "line": null,
+      "description": "No CI configuration workflow file exists for the repository",
+      "evidence": "No .github/workflows directory or CI configuration files found.",
+      "recommendation": "Add a GitHub Actions workflow file to run linting, building, and tests on pull requests and pushes."
+    },
+    {
+      "rule_id": "TST-001",
+      "category": "testing",
+      "severity": "medium",
+      "file": null,
+      "line": null,
+      "description": "No automated tests exist in the repository",
+      "evidence": "No test directory, test files, or test scripts found in package.json or file tree.",
+      "recommendation": "Add unit and integration tests using Jest, Vitest, or Playwright, and run them in CI."
+    }
+  ]
+}
