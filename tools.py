@@ -65,6 +65,7 @@ class WorkflowObservation:
     summary: str
     evidence: tuple[str, ...]
     mitigation: str
+    report_required: bool
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -384,6 +385,7 @@ class RepoTools:
         """Extract high-signal facts. These are review leads, never automatic violations."""
         lines = raw.splitlines()
         grouped: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        required_kinds: set[str] = set()
 
         run_block_indent: int | None = None
         for n, line in enumerate(lines, 1):
@@ -402,30 +404,40 @@ class RepoTools:
             )
             if in_run and untrusted:
                 grouped["script_injection"].append((n, "untrusted event/input expression is interpolated directly into a shell script"))
+                required_kinds.add("script_injection")
             if re.search(r"^\s*runs-on:\s*.*\$\{\{.*(?:github\.event\.|inputs\.)", line):
                 grouped["runner_injection"].append((n, "event input controls the runner label"))
+                required_kinds.add("runner_injection")
             if in_run and re.search(r"(?:^|[;&|]\s*)set\s+-[A-Za-z]*x[A-Za-z]*\b", stripped):
                 grouped["shell_trace"].append((n, "shell xtrace is enabled and can log expanded secret values"))
+                required_kinds.add("shell_trace")
             if in_run and re.search(r"\b(?:echo|printf|printenv)\b", line, re.I) and re.search(
                 r"(?:\$\{\{\s*secrets\.|\$(?:\{)?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*(?:\})?)",
                 line,
                 re.I,
             ):
                 grouped["secret_log"].append((n, "a secret expression or secret-named variable is printed to the job log"))
+                placeholder_variable = re.search(r"\$(?:\{)?(?:DEMO|FAKE|DUMMY)_[A-Z0-9_]*(?:\})?", line, re.I)
+                if "${{ secrets." in line.lower() or not placeholder_variable:
+                    required_kinds.add("secret_log")
             if in_run and re.search(r"\bcurl\b[^\n]*(?:\s-v\b|--verbose\b)", line) and re.search(
                 r"authorization|bearer|token|secret|password", "\n".join(lines[max(0, n - 3):min(len(lines), n + 2)]), re.I
             ):
                 grouped["secret_log"].append((n, "verbose curl is used near an authorization credential"))
+                required_kinds.add("secret_log")
             if in_run and (
                 re.search(r"\bnpm\s+publish\b[^\n]*(?:--token|--_authToken)\b", line, re.I)
                 or re.search(r"\bdocker\s+login\b[^\n]*(?:-p\b|--password\b)", line, re.I)
                 or re.search(r"\btwine\s+upload\b[^\n]*--password\b", line, re.I)
             ):
                 grouped["secret_cli"].append((n, "a credential is supplied through a command-line argument"))
+                required_kinds.add("secret_cli")
             if "::set-output" in line:
                 grouped["deprecated_command"].append((n, "deprecated ::set-output workflow command is emitted"))
+                required_kinds.add("deprecated_command")
             if re.search(r"contains\s*\([^\n]*github\.actor", line, re.I):
                 grouped["actor_allowlist"].append((n, "substring matching is used as an actor authorization gate"))
+                required_kinds.add("actor_allowlist")
 
         # Inspect upload-artifact step bodies for sensitive paths.
         for i, line in enumerate(lines):
@@ -437,6 +449,7 @@ class RepoTools:
             block = "\n".join(lines[i:end])
             if re.search(r"(?:^|[/\\])\.env(?:\.|$)|credentials?(?:\.json)?|\.ssh|id_rsa|private[_-]?key|\.pem\b", block, re.I | re.M):
                 grouped["sensitive_artifact"].append((i + 1, "upload-artifact includes credential, environment, SSH, or private-key paths"))
+                required_kinds.add("sensitive_artifact")
 
         # Multiple downloads writing the same basename can silently overwrite one another.
         destinations: dict[str, list[int]] = defaultdict(list)
@@ -447,6 +460,7 @@ class RepoTools:
         for name, positions in destinations.items():
             if name and len(positions) > 1:
                 grouped["download_collision"].append((positions[0], f"multiple downloads write the same filename {name!r}"))
+                required_kinds.add("download_collision")
 
         meta = {
             "script_injection": ("SEC-005", "Possible shell-script injection"),
@@ -471,6 +485,7 @@ class RepoTools:
                 summary=summary,
                 evidence=tuple(f"line {line_no}: {detail}" for line_no, detail in facts),
                 mitigation="; ".join(sorted(guards)),
+                report_required=kind in required_kinds,
             ))
         return observations
 
@@ -550,7 +565,12 @@ class RepoTools:
                 out.append(
                     f"- {observation.id} [{observation.kind}; suggested {observation.suggested_rule}] "
                     f"{observation.file}:{observation.line} - {observation.summary}. "
-                    f"Facts: {'; '.join(observation.evidence)}. Guard check: {observation.mitigation}."
+                    f"Facts: {'; '.join(observation.evidence)}. Guard check: {observation.mitigation}. "
+                    + (
+                        "Disposition: tracked anti-pattern; record a finding (guards may lower severity)."
+                        if observation.report_required
+                        else "Disposition: contextual review allowed (possible explicit placeholder)."
+                    )
                 )
             out.append(
                 "Read the cited lines, then call resolve_observation for every ID. Documentation claiming a "
@@ -701,8 +721,9 @@ INSPECTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "Parse GitHub Actions workflows: triggers, permissions, jobs, steps, action ref pinning, and "
             "line-numbered notable lines. Emits stable HIGH-RISK OBSERVATION IDs for event-to-shell injection, "
             "input-controlled runners, shell tracing, credential logging/CLI arguments, sensitive artifacts, "
-            "deprecated commands, actor gates, and download collisions. Each observation is a fact to inspect "
-            "and must be resolved explicitly; it is not automatically a violation. Also reports other CI systems, "
+            "deprecated commands, actor gates, and download collisions. Each observation is a fact to inspect and "
+            "must be resolved explicitly. Tracked anti-pattern observations require a finding even when deliberately "
+            "planted or guarded; explicit placeholder signals allow contextual review. Also reports other CI systems, "
             "Dependabot/Renovate, CODEOWNERS and pre-commit configs."
         ),
         "input_schema": {

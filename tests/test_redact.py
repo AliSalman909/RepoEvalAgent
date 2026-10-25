@@ -75,3 +75,8 @@ def test_harmless_values_are_not_masked(text):
 def test_redaction_is_idempotent():
     once = redact('token = "abcdef1234567890"')
     assert redact(once) == once
+
+
+def test_secret_named_yaml_parent_does_not_redact_nested_key():
+    workflow = "  echo-fake-secret:\n    runs-on: ubuntu-latest\n"
+    assert redact(workflow) == workflow

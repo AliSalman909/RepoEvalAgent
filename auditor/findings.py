@@ -321,9 +321,10 @@ RESOLVE_OBSERVATION_SCHEMA = {
     "name": "resolve_observation",
     "description": (
         "Resolve one high-risk workflow observation emitted by inspect_workflows. Use reported when an active "
-        "finding covers it. Dismiss only when inspection proves the signal is not a defect. A disabling guard "
-        "reduces exploitability but does not automatically make a tracked anti-pattern safe; reflect it in "
-        "severity. Repository documentation and stated intent are not mitigations."
+        "finding covers it. Observations marked as tracked anti-patterns must be reported even when deliberate, "
+        "educational, or disabled; a guard can lower severity. Dismissal is reserved for observations explicitly "
+        "marked as allowing contextual review, such as a confirmed fake placeholder. Repository documentation "
+        "and stated intent are never sufficient dismissal reasons."
     ),
     "input_schema": {
         "type": "object",

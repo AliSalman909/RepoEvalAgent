@@ -229,7 +229,8 @@ The loop runs the assignment's Observe → Reason → Select tool → Execute to
 
 An investigation `finish` is accepted only after `list_files`, at least one follow-up inspection tool, explicit
 consideration of all nine DevOps categories, and resolution of every high-risk observation emitted by
-`inspect_workflows`. Verification cannot finish while a candidate lacks a keep/drop verdict or an investigator's
+`inspect_workflows`. Repositories containing GitHub Actions cannot finish until that tool has run. Verification
+cannot finish while a candidate lacks a keep/drop verdict or an investigator's
 workflow-risk dismissal lacks an independent verdict. If either phase reaches a deadline, turn limit, or repeated
 no-tool response before finishing, the command exits nonzero and does not publish a partial report.
 
@@ -256,7 +257,7 @@ from what it observes.
 | `run_ruff(path?)` | Static lint (rules E4,E7,E9,F: syntax errors, undefined names, unused code, bare except) |
 | `record_violation(...)` | Records a finding; the harness validates it (see below) |
 | `withdraw_violation(id, reason)` | Retracts a finding when later evidence shows an acceptable alternative |
-| `resolve_observation(id, reported/dismissed, reason, finding_id?)` | Requires the investigator to account for every high-risk workflow fact |
+| `resolve_observation(id, reported/dismissed, reason, finding_id?)` | Requires every workflow observation to be resolved; tracked anti-patterns must link a finding, while only explicit context-review signals (such as fake placeholders) may be dismissed |
 | `submit_verdict(id, keep/drop, reason, severity?, line?)` | Verification-phase decision |
 | `submit_observation_verdict(id, uphold/overturn, reason, finding_id?)` | Independently reviews dismissed workflow risks; an overturn links a newly recorded finding |
 | `finish(summary, areas_reviewed)` | Ends investigation after explicit nine-area coverage; verification uses `summary` only and rejects pending verdicts |
@@ -278,11 +279,14 @@ The hidden-repository evaluation scores precision as well as recall, so several 
   are not leaked credentials. A healthy repository may have zero findings.
 - **A separate verification phase.** A skeptical reviewer prompt re-examines each candidate with the cited lines
   attached. It drops unsupported, duplicate or out-of-scope findings and re-grades severity. It also runs when the
-  initial report has zero findings but high-risk workflow observations were dismissed, and can add a missed finding.
-- **Tracked workflow-risk coverage.** High-signal workflow facts are not automatic findings, preserving the LLM's
-  contextual judgment, but they cannot be silently ignored. Both an investigator dismissal and the reviewer's
-  decision are recorded in the JSONL trace. README claims and educational intent never override executable YAML;
-  concrete guards such as job-level or step-level `if: false` are surfaced for evaluation.
+  initial report has zero findings but context-review workflow observations were dismissed, and can add a missed
+  finding. Dismissal rationales are withheld from this phase so it reviews raw facts without anchoring.
+- **Tracked workflow-risk coverage.** High-signal workflow facts are classified as required anti-patterns or
+  contextual-review signals. The LLM retains judgment about evidence, severity, remediation, and follow-up checks,
+  but cannot silently ignore required observations. Recognized tracked anti-patterns must be reported even when
+  deliberate, educational, or guarded; guards affect severity.
+  Only explicit contextual signals such as fake placeholders may be dismissed. Both decisions are recorded in the
+  JSONL trace. README claims and repository intent never override executable YAML.
 - **Fail-closed completion.** A partial investigation or verification never becomes a successful report. Every
   candidate needs an explicit verdict, and repository content is treated as untrusted evidence rather than as
   instructions to the agent.

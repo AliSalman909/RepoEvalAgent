@@ -71,7 +71,9 @@ _SECRET_NAME = (
     r"|private[_-]?key|client[_-]?secret|credentials?|auth[_-]?key)[\w.-]*"
 )
 # The name may be followed by a closing quote and/or bracket: `password=`, `"password":`, `cfg["password"] =`.
-_NAME_END = r"[\"']?\]?\s*(?::=|=>|[:=])\s*"
+# Horizontal whitespace is intentional: allowing `\s` here crosses newlines and can mistake a YAML mapping named
+# `fake-secret:` for an assignment whose value is the next nested key (for example `runs-on:`).
+_NAME_END = r"[\"']?\]?[ \t]*(?::=|=>|[:=])[ \t]*"
 _ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>\b" + _SECRET_NAME + _NAME_END + r")"
     r"(?P<quote>[\"']?)(?P<value>[^\"'\s,;#}]{4,})(?P=quote)"

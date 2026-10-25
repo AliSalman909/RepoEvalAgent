@@ -149,6 +149,28 @@ jobs:
     assert "HIGH-RISK OBSERVATIONS" in out and "must be resolved before finish" in out
     inert = [o for o in observations if o.file.endswith("inert.yml")]
     assert inert and all("if: false guard" in o.mitigation for o in inert)
+    assert all(o.report_required for o in observations)
+
+
+def test_explicit_fake_secret_log_allows_context_review(tmp_path):
+    repo = make_repo(tmp_path / "placeholder-log", [("initial", {
+        ".github/workflows/demo.yml": """\
+name: Placeholder
+on: workflow_dispatch
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    env:
+      DEMO_SECRET: NOT_A_REAL_SECRET
+    steps:
+      - run: echo "$DEMO_SECRET"
+""",
+    }, [])])
+    tools = RepoTools(repo)
+    tools.inspect_workflows()
+    assert len(tools.workflow_observations) == 1
+    observation = tools.workflow_observations[0]
+    assert observation.kind == "secret_log" and not observation.report_required
 
 
 def test_check_gitignore(defect_repo, healthy_repo):

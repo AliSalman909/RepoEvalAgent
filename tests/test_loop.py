@@ -125,7 +125,7 @@ def test_full_audit_llm_driven_tool_selection(defect_repo):
                     "evidence": "Claimed README absence", "recommendation": "Add a README.md"})]
 
     llm = FakeLLM([
-        [("list_files", {})],
+        [("list_files", {}), ("inspect_workflows", {})],
         investigate_secret,
         record_from_search,
         [("finish", _audit_finish())],
@@ -196,6 +196,22 @@ def test_investigation_finish_requires_mapping_followup_and_all_areas(defect_rep
     assert "not yet confirmed" in last_tool_results(llm.calls[5]["messages"])[0]["content"]
 
 
+def test_workflow_repository_must_run_workflow_inspection(defect_repo):
+    llm = FakeLLM([
+        [("list_files", {}), ("search_code", {"pattern": "API_KEY"})],
+        [("finish", _audit_finish())],
+        [("inspect_workflows", {})],
+        [("finish", _audit_finish())],
+    ])
+    result = run_audit(
+        "u", _checkout(defect_repo), llm, Tracer(None, verbose=False),
+        AuditConfig(max_steps=4, verify=False),
+    )
+    rejected_finish = last_tool_results(llm.calls[2]["messages"])[0]
+    assert rejected_finish["is_error"] and "call inspect_workflows" in rejected_finish["content"]
+    assert result.phases["investigate"].finished
+
+
 def test_incomplete_investigation_raises_instead_of_building_partial_report(defect_repo):
     llm = FakeLLM([[("list_files", {}), ("inspect_workflows", {})]])
     with pytest.raises(AuditIncompleteError, match="investigation stopped before finish"):
@@ -220,7 +236,7 @@ def test_incomplete_verification_raises_instead_of_keeping_undecided(defect_repo
         )
 
 
-def test_dismissed_active_workflow_risk_gets_zero_finding_recall_review(tmp_path):
+def test_active_workflow_antipattern_cannot_be_dismissed_as_educational(tmp_path):
     repo = make_repo(tmp_path / "active-injection", [("initial", {
         "README.md": "# Educational example\nThis is intentionally safe.\n",
         ".github/workflows/injection.yml": """\
@@ -247,9 +263,10 @@ jobs:
             }),
         ]
 
-    def overturn_dismissal(messages):
-        prompt = messages[0]["content"]
-        assert seen["id"] in prompt and "investigator dismissal" in prompt
+    def report_after_rejected_dismissal(messages):
+        results = last_tool_results(messages)
+        dismissal = next(result for result in results if result["name"] == "resolve_observation")
+        assert dismissal["is_error"] and "cannot be dismissed" in dismissal["content"]
         return [
             ("record_violation", {
                 "rule_id": "SEC-005", "category": "security", "severity": "high",
@@ -258,17 +275,21 @@ jobs:
                 "evidence": "The run step directly expands github.event.issue.title.",
                 "recommendation": "Pass the title through an environment variable and quote it in the shell.",
             }),
-            ("submit_observation_verdict", {
-                "observation_id": seen["id"], "decision": "overturn", "finding_id": "V1",
-                "reason": "The workflow is active and contains no job-level or step-level false guard.",
+            ("resolve_observation", {
+                "observation_id": seen["id"], "decision": "reported", "finding_id": "V1",
+                "reason": "The tracked direct event-to-shell interpolation is covered by V1.",
             }),
         ]
 
     llm = FakeLLM([
         [("list_files", {}), ("inspect_workflows", {})],
         dismiss_observation,
+        report_after_rejected_dismissal,
         [("finish", _audit_finish())],
-        overturn_dismissal,
+        [("submit_verdict", {
+            "finding_id": "V1", "decision": "drop",
+            "reason": "The README says this was deliberately inserted for education.",
+        })],
         [("submit_verdict", {"finding_id": "V1", "decision": "keep", "reason": "Active injection confirmed"})],
         [("finish", {"summary": "recall review complete"})],
     ])
@@ -277,7 +298,58 @@ jobs:
         AuditConfig(max_steps=6, verify_steps=5),
     )
     assert [v["rule_id"] for v in result.report["violations"]] == ["SEC-005"]
-    assert result.phases["verify"].finished
+    rejected_drop = last_tool_results(llm.calls[5]["messages"])[0]
+    assert rejected_drop["is_error"] and "cannot be dropped" in rejected_drop["content"]
+    assert result.phases["verify"].finished and len(llm.calls) == 7
+
+
+def test_fake_placeholder_dismissal_gets_blind_zero_finding_review(tmp_path):
+    repo = make_repo(tmp_path / "fake-placeholder", [("initial", {
+        "README.md": "# Demo\n",
+        ".github/workflows/demo.yml": """\
+name: Placeholder demo
+on: workflow_dispatch
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    env:
+      DEMO_SECRET: NOT_A_REAL_SECRET
+    steps:
+      - run: echo "$DEMO_SECRET"
+""",
+    }, [])])
+    seen: dict[str, str] = {}
+
+    def dismiss_placeholder(messages):
+        output = "\n".join(result["content"] for result in last_tool_results(messages))
+        seen["id"] = re.search(r"WF-[0-9A-F]{8}", output).group(0)
+        return [("resolve_observation", {
+            "observation_id": seen["id"], "decision": "dismissed",
+            "reason": "DEMO_SECRET is explicitly assigned the NOT_A_REAL_SECRET placeholder.",
+        })]
+
+    def uphold_independently(messages):
+        prompt = messages[0]["content"]
+        assert seen["id"] in prompt
+        assert "NOT_A_REAL_SECRET placeholder" not in prompt
+        assert "rationale is intentionally withheld" in prompt
+        return [("submit_observation_verdict", {
+            "observation_id": seen["id"], "decision": "uphold",
+            "reason": "The variable is an explicit fake placeholder rather than a credential.",
+        })]
+
+    llm = FakeLLM([
+        [("list_files", {}), ("inspect_workflows", {})],
+        dismiss_placeholder,
+        [("finish", _audit_finish())],
+        uphold_independently,
+        [("finish", {"summary": "placeholder dismissal verified"})],
+    ])
+    result = run_audit(
+        "u", _checkout(repo), llm, Tracer(None, verbose=False),
+        AuditConfig(max_steps=5, verify_steps=3),
+    )
+    assert result.report["violations"] == [] and result.phases["verify"].finished
 
 
 def test_investigation_cannot_finish_with_unresolved_workflow_observation(tmp_path):
@@ -306,10 +378,19 @@ jobs:
             for result in message["results"]
         )
         observed["id"] = re.search(r"WF-[0-9A-F]{8}", all_text).group(0)
-        return [("resolve_observation", {
-            "observation_id": observed["id"], "decision": "dismissed",
-            "reason": "Explicitly reviewed for this harness test.",
-        })]
+        return [
+            ("record_violation", {
+                "rule_id": "SEC-005", "category": "security", "severity": "high",
+                "file": ".github/workflows/injection.yml", "line": 7,
+                "description": "Issue title is interpolated directly into a shell command.",
+                "evidence": "The run step directly expands github.event.issue.title.",
+                "recommendation": "Pass the title through a quoted environment variable.",
+            }),
+            ("resolve_observation", {
+                "observation_id": observed["id"], "decision": "reported", "finding_id": "V1",
+                "reason": "The workflow anti-pattern is recorded as V1.",
+            }),
+        ]
 
     llm = FakeLLM([
         [("list_files", {}), ("inspect_workflows", {})],
@@ -321,4 +402,5 @@ jobs:
         "u", _checkout(repo), llm, Tracer(None, verbose=False),
         AuditConfig(max_steps=5, verify=False),
     )
-    assert result.phases["investigate"].finished and result.report["violations"] == []
+    assert result.phases["investigate"].finished
+    assert [finding["rule_id"] for finding in result.report["violations"]] == ["SEC-005"]

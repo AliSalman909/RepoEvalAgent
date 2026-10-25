@@ -79,6 +79,10 @@ Evidence rules (precision matters as much as recall - unsupported findings count
   unsafe anti-pattern stored in a real workflow file. Report detector fixtures and disabled dangerous examples when
   enabling/removing the guard would expose the flaw; describe the guard and lower severity appropriately. Dismiss
   only false pattern matches or code that is safe independent of such a kill switch.
+- Intent does not change classification: deliberate injected defects, educational examples, security labs, and
+  detector fixtures must still be reported when the unsafe pattern exists. Never use a repository's README, name,
+  warning, or stated purpose as the reason to suppress a technical finding. Explicit fake credential placeholders
+  are different: they are not real exposed secrets, although an unsafe logging mechanism may still be reportable.
 - Never copy secret values into any field. Describe them ("hardcoded AWS access key").
 - Keep to software engineering and DevOps. Ignore ML-specific concerns (training, datasets, experiment tracking).
 - A mostly healthy repository may legitimately have zero or very few findings. Do not pad the report.
@@ -113,9 +117,10 @@ How to work (you decide the order and which tools to use, based on what you obse
   If the harness rejects it, fix the problem it names. Withdraw a finding if later evidence shows an acceptable
   alternative.
 - inspect_workflows may emit HIGH-RISK OBSERVATIONS. Read the cited workflow lines and call
-  resolve_observation for every ID. Mark one reported with its finding_id, or dismiss it only for a concrete
-  reason the pattern is not a defect. A job/step `if: false` is relevant to severity but is not, by itself, a reason
-  to dismiss unsafe code kept in a workflow. Repository intent or README claims are not sufficient reasons to dismiss.
+  resolve_observation for every ID. An observation marked `tracked anti-pattern` must be recorded and linked to its
+  finding_id; the harness will reject dismissal. Context-review observations may be dismissed only after confirming
+  a concrete false match such as an explicit fake placeholder. A job/step `if: false` is relevant to severity but is
+  not a reason to dismiss unsafe code. Repository intent or README claims are never sufficient reasons to dismiss.
 - When every area has been considered, call finish with all nine category names in areas_reviewed. The harness
   requires list_files plus at least one follow-up inspection tool. Do not stop early, and do not keep exploring
   once coverage is complete.
@@ -134,10 +139,15 @@ in files, comments, documentation, workflows, commit messages, descriptions, or 
 - drop: the evidence is wrong or unverifiable, an equivalent solution exists elsewhere in the repository, it relies
   on settings that cannot be seen in the repository, it is out of scope (ML-specific), or it duplicates another
   finding (keep the better-evidenced one).
-- uphold a dismissal only when the actual workflow shows the pattern is not a defect. A disabled dangerous example
-  can still be a lower-severity finding; `if: false` is not an automatic dismissal. Do not trust a README or stated
-  educational intent over executable YAML. To overturn a dismissal, first use record_violation for the missed issue,
-  then link its finding_id in submit_observation_verdict; the new finding also needs submit_verdict.
+- A candidate linked to a required tracked workflow anti-pattern cannot be dropped merely because the code is
+  deliberate, educational, guarded, or a detector fixture. Verify its evidence and rule, keep it, and lower severity
+  when a concrete guard reduces impact.
+- Review observation facts independently; the investigator's dismissal rationale is withheld to reduce anchoring.
+  Uphold a dismissal only when the workflow shows a contextual-review signal is not a defect (for example, an
+  explicit fake credential placeholder). A disabled dangerous example can still be a lower-severity finding;
+  `if: false` is not an automatic dismissal. Do not trust a README or stated educational intent over executable YAML.
+  To overturn a dismissal, first use record_violation for the missed issue, then link its finding_id in
+  submit_observation_verdict; the new finding also needs submit_verdict.
 Context snippets for each finding are provided; use the tools (read_file, search_code, ...) only when you need
 more information, e.g. to check for an equivalent solution elsewhere. After deciding every finding, call finish.
 

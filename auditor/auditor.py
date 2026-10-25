@@ -153,10 +153,22 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
                     f"{finding.id} cites {finding.file or 'the repository'}, but {observation_id} is in "
                     f"{observation.file}"
                 )
+            if observation.report_required and finding.rule_id != observation.suggested_rule:
+                raise ToolError(
+                    f"{observation_id} requires {observation.suggested_rule}, but {finding.id} uses "
+                    f"{finding.rule_id}; record or link the correctly classified finding"
+                )
             finding_id = finding.id
         elif decision == "dismissed":
             if finding_id:
                 raise ToolError("dismissed observations must not provide finding_id")
+            if observation.report_required:
+                raise ToolError(
+                    f"{observation_id} is a confirmed tracked workflow anti-pattern ({observation.kind}) and "
+                    "cannot be dismissed because it is deliberate, educational, a detector fixture, or guarded. "
+                    "Record a finding, mention any guard in the evidence, adjust severity if appropriate, then "
+                    "resolve it as reported with finding_id."
+                )
             finding_id = None
         else:
             raise ToolError("decision must be 'reported' or 'dismissed'")
@@ -180,6 +192,15 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
                 "Not finished: use at least one follow-up inspection tool after mapping the repository.",
                 is_error=True,
             )
+        has_github_workflows = any(
+            file.startswith(".github/workflows/") and file.endswith((".yml", ".yaml"))
+            for file in tools.tracked_files()
+        )
+        if has_github_workflows and "inspect_workflows" not in inspection_tools_used:
+            return ToolResult(
+                "Not finished: GitHub Actions workflows exist; call inspect_workflows before completing the audit.",
+                is_error=True,
+            )
         pending_observations = [
             observation.id for observation in tools.workflow_observations
             if observation.id not in observation_resolutions
@@ -188,6 +209,19 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
             return ToolResult(
                 "Not finished: high-risk workflow observations still need resolve_observation: "
                 + ", ".join(pending_observations) + ".",
+                is_error=True,
+            )
+        invalid_links = []
+        for observation_id, resolution in observation_resolutions.items():
+            if resolution["decision"] != "reported" or not resolution["finding_id"]:
+                continue
+            finding = store.get(str(resolution["finding_id"]))
+            if finding.status not in ("candidate", "kept"):
+                invalid_links.append(f"{observation_id}->{finding.id} ({finding.status})")
+        if invalid_links:
+            return ToolResult(
+                "Not finished: reported workflow observations no longer have active findings: "
+                + ", ".join(invalid_links) + ".",
                 is_error=True,
             )
         return ToolResult("Investigation finished.", terminal=True)
@@ -220,6 +254,24 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
         if observation_resolutions.get(observation.id, {}).get("decision") == "dismissed"
     ]
     if config.verify and (candidates or dismissed_observations):
+        def submit_finding_verdict(args: dict[str, Any]) -> ToolResult:
+            finding = store.get(str(args["finding_id"]))
+            if str(args["decision"]).lower() == "drop":
+                observations = {o.id: o for o in tools.workflow_observations}
+                required_links = [
+                    observation_id
+                    for observation_id, resolution in observation_resolutions.items()
+                    if resolution.get("finding_id") == finding.id
+                    and observations[observation_id].report_required
+                ]
+                if required_links:
+                    raise ToolError(
+                        f"{finding.id} is required by tracked workflow anti-pattern(s) "
+                        f"{', '.join(required_links)} and cannot be dropped for being deliberate, educational, "
+                        "a detector fixture, or guarded. Keep it and adjust severity if needed."
+                    )
+            return store.verdict(args)
+
         def submit_observation_verdict(args: dict[str, Any]) -> ToolResult:
             observation_id = str(args["observation_id"]).strip().upper()
             dismissed = {o.id: o for o in dismissed_observations}
@@ -275,7 +327,7 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
         ver_handlers = {
             **inspect_handlers,
             "record_violation": store.record,
-            "submit_verdict": store.verdict,
+            "submit_verdict": submit_finding_verdict,
             "submit_observation_verdict": submit_observation_verdict,
             "finish": finish_verification,
         }
@@ -288,12 +340,12 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
             )
         observation_blocks = []
         for observation in dismissed_observations:
-            resolution = observation_resolutions[observation.id]
             observation_blocks.append(
                 f"### {observation.id}\nkind={observation.kind} suggested_rule={observation.suggested_rule} "
                 f"file={observation.file} line={observation.line}\nsummary: {observation.summary}\n"
                 f"facts: {'; '.join(observation.evidence)}\nguard check: {observation.mitigation}\n"
-                f"investigator dismissal: {resolution['reason']}"
+                "Review this from the raw facts independently. The investigator's rationale is intentionally "
+                "withheld to avoid anchoring."
             )
         task = (
             f"Repository: {repo_url} (default branch '{checkout.default_branch}').\n"
@@ -337,6 +389,7 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
         workflow_observations=[
             {
                 "id": o.id, "kind": o.kind, "file": o.file, "line": o.line,
+                "report_required": o.report_required,
                 "investigation": observation_resolutions.get(o.id),
                 "verification": observation_verdicts.get(o.id),
             }
