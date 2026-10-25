@@ -373,3 +373,7 @@ sample_report.json    authentic example output
   whether they exist, whether CI runs them, and whether failures are suppressed.
 - As with any LLM-based reviewer, results can vary between runs. The verification phase and harness validation are
   there to keep reported findings defensible.
+
+---
+
+Made by **Ali Bin Salman**.
