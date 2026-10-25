@@ -204,11 +204,11 @@ auditor/auditor.py  ── orchestrates two agent phases over the same tools
   │
   ├─ Phase 1: INVESTIGATION  (AgentLoop, up to 45 turns)
   │     LLM ⇄ list_files / read_file / search_code / git_log / inspect_workflows /
-  │           check_gitignore / run_ruff / record_violation / withdraw_violation / finish
+  │           check_gitignore / run_ruff / record_violation / resolve_observation / finish
   │
   ├─ Phase 2: VERIFICATION   (AgentLoop, up to 20 turns)
-  │     LLM reviews every candidate (cited lines pre-attached), may use the inspection
-  │     tools again, and must submit_verdict keep/drop (+ severity re-grade) for each
+  │     LLM reviews every candidate and each dismissed high-risk workflow observation,
+  │     may add a missed finding, and must submit an explicit verdict for every item
   │
   └─ auditor/report.py ── contract validation, sorting, final redaction, atomic write
 ```
@@ -227,10 +227,11 @@ The loop runs the assignment's Observe → Reason → Select tool → Execute to
    `inspect_workflows`.
 5. This repeats until the model calls `finish`, or a budget ends the phase.
 
-An investigation `finish` is accepted only after `list_files`, at least one follow-up inspection tool, and explicit
-consideration of all nine DevOps categories. Verification cannot finish while any candidate lacks a keep/drop
-verdict. If either phase reaches a deadline, turn limit, or repeated no-tool response before finishing, the command
-exits nonzero and does not publish a partial report.
+An investigation `finish` is accepted only after `list_files`, at least one follow-up inspection tool, explicit
+consideration of all nine DevOps categories, and resolution of every high-risk observation emitted by
+`inspect_workflows`. Verification cannot finish while a candidate lacks a keep/drop verdict or an investigator's
+workflow-risk dismissal lacks an independent verdict. If either phase reaches a deadline, turn limit, or repeated
+no-tool response before finishing, the command exits nonzero and does not publish a partial report.
 
 Python enforces the budgets: a turn cap per phase, a wall-clock deadline, and a stop after repeated text-only
 replies. A countdown is appended after each turn's tool results so the model can pace itself, and it is told to
@@ -250,12 +251,14 @@ from what it observes.
 | `read_file(path, start_line?, end_line?)` | Line-numbered file content (250-line windows), binary detection |
 | `search_code(pattern, path_glob?, ignore_case?, fixed_string?, max_results?)` | Regex search over tracked text files via `git grep` (PCRE when available) |
 | `git_log(max_count?, path?, grep_diff?, show_files?, show_patch?)` | Commit history; `grep_diff` finds commits that added or removed matching lines, such as secrets deleted later |
-| `inspect_workflows(path?)` | Parses GitHub Actions workflows: triggers, permissions, jobs, steps, action pinning, line-numbered notable lines; detects other CI systems, Dependabot/Renovate, CODEOWNERS, pre-commit |
+| `inspect_workflows(path?)` | Parses workflows and emits tracked risk observations for event-to-shell interpolation, input-controlled runners, shell tracing, credential logging/CLI arguments, sensitive artifacts, deprecated commands, bypassable actor gates, and download collisions; also reports concrete guards and related CI config |
 | `check_gitignore(paths)` | Whether paths are ignored (and by which rule) and whether they are tracked |
 | `run_ruff(path?)` | Static lint (rules E4,E7,E9,F: syntax errors, undefined names, unused code, bare except) |
 | `record_violation(...)` | Records a finding; the harness validates it (see below) |
 | `withdraw_violation(id, reason)` | Retracts a finding when later evidence shows an acceptable alternative |
+| `resolve_observation(id, reported/dismissed, reason, finding_id?)` | Requires the investigator to account for every high-risk workflow fact |
 | `submit_verdict(id, keep/drop, reason, severity?, line?)` | Verification-phase decision |
+| `submit_observation_verdict(id, uphold/overturn, reason, finding_id?)` | Independently reviews dismissed workflow risks; an overturn links a newly recorded finding |
 | `finish(summary, areas_reviewed)` | Ends investigation after explicit nine-area coverage; verification uses `summary` only and rejects pending verdicts |
 
 All tool outputs are size-capped and returned to the LLM for interpretation.
@@ -265,7 +268,8 @@ All tool outputs are size-capped and returned to the LLM for interpretation.
 The hidden-repository evaluation scores precision as well as recall, so several layers guard against false positives.
 
 - **Harness validation of every finding.** The category and severity must be allowed values. The cited file must
-  exist. The line must be inside the file. Duplicates (same rule and location) are rejected. A snippet quoted in the
+  exist. The line must be inside the file. Exact duplicates are rejected, while repeated occurrences of the same
+  rule in one file are grouped into one root-cause finding. A snippet quoted in the
   evidence must appear at or near the cited line; if it appears elsewhere, the error tells the model the right line.
   Rejections go back to the model as tool errors, so it re-checks instead of guessing.
 - **Evidence rules in the prompt.** Equivalent alternatives are not violations. Examples: `pyproject.toml` instead
@@ -273,7 +277,12 @@ The hidden-repository evaluation scores precision as well as recall, so several 
   major-version tags. Remote settings such as branch protection are never inferred. Placeholders and test fixtures
   are not leaked credentials. A healthy repository may have zero findings.
 - **A separate verification phase.** A skeptical reviewer prompt re-examines each candidate with the cited lines
-  attached. It drops unsupported, duplicate or out-of-scope findings and re-grades severity.
+  attached. It drops unsupported, duplicate or out-of-scope findings and re-grades severity. It also runs when the
+  initial report has zero findings but high-risk workflow observations were dismissed, and can add a missed finding.
+- **Tracked workflow-risk coverage.** High-signal workflow facts are not automatic findings, preserving the LLM's
+  contextual judgment, but they cannot be silently ignored. Both an investigator dismissal and the reviewer's
+  decision are recorded in the JSONL trace. README claims and educational intent never override executable YAML;
+  concrete guards such as job-level or step-level `if: false` are surfaced for evaluation.
 - **Fail-closed completion.** A partial investigation or verification never becomes a successful report. Every
   candidate needs an explicit verdict, and repository content is treated as untrusted evidence rather than as
   instructions to the agent.
@@ -304,13 +313,13 @@ The hidden-repository evaluation scores precision as well as recall, so several 
 pytest
 ```
 
-The tests build throwaway git repositories with injected defects. Examples are a hardcoded key, a tracked `.env`, a
-`pull_request_target` workflow with `write-all` and `|| true`, an action on `@main`, a committed-then-deleted token, a
+The tests build throwaway git repositories with injected defects. Examples include a hardcoded key, a tracked `.env`,
+workflow injection and secret-leak patterns, explicitly inert workflow examples, a committed-then-deleted token, a
 machine-specific path and a tracked `.pyc`. The agent loop is driven by a scripted fake LLM, so no API key is needed.
 Coverage:
 
 - **Tools** (`tests/test_tools.py`): outputs, path traversal rejection, binary handling, regex errors, history
-  search, workflow parsing, gitignore checks, and that no tool modifies the repo.
+  search, active/mitigated workflow-risk extraction, gitignore checks, and that no tool modifies the repo.
 - **Redaction** (`tests/test_redact.py`): secrets are masked; env references and placeholders are preserved.
 - **Finding validation** (`tests/test_findings.py`): bad severity, category, file or line, fabricated evidence,
   duplicates, withdraw and verdicts.
@@ -319,8 +328,8 @@ Coverage:
   conversion, function-call parsing, thought-signature preservation, function responses with `id`/`name`,
   finish-reason mapping (safety, malformed call, max tokens), and API-error mapping.
 - **Agent loop** (`tests/test_loop.py`): parallel dispatch and call-id matching, error feedback, nudging, step
-  and deadline budgets, truncated turns, refusal, follow-up calls that depend on earlier observations, and
-  verification semantics.
+  and deadline budgets, truncated turns, refusal, required observation resolution, zero-finding recall review,
+  follow-up calls that depend on earlier observations, and verification semantics.
 - **CLI** (`tests/test_cli.py`): URL validation, failure exit codes, end-to-end report and trace, empty report, and
   that the repository is unchanged.
 

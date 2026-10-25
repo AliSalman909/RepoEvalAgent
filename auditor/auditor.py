@@ -13,7 +13,9 @@ from auditor.findings import (
     CATEGORIES,
     FINISH_SCHEMA,
     INVESTIGATION_FINISH_SCHEMA,
+    OBSERVATION_VERDICT_SCHEMA,
     RECORD_VIOLATION_SCHEMA,
+    RESOLVE_OBSERVATION_SCHEMA,
     VERDICT_SCHEMA,
     WITHDRAW_SCHEMA,
     Finding,
@@ -49,7 +51,10 @@ class AuditIncompleteError(Exception):
 
 
 # Control tools receive the validated argument dict itself; inspection tools get **kwargs.
-_CONTROL_TOOLS = {"record_violation", "withdraw_violation", "finish", "submit_verdict"}
+_CONTROL_TOOLS = {
+    "record_violation", "withdraw_violation", "finish", "submit_verdict",
+    "resolve_observation", "submit_observation_verdict",
+}
 
 
 def _dispatcher(schemas: list[dict[str, Any]], handlers: dict[str, Callable[..., Any]]) -> Callable[[str, dict[str, Any]], ToolResult]:
@@ -114,6 +119,8 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
 
     inspect_handlers = {name: tracked_handler(name, handler) for name, handler in raw_inspect_handlers.items()}
     phases: dict[str, LoopOutcome] = {}
+    observation_resolutions: dict[str, dict[str, str | None]] = {}
+    observation_verdicts: dict[str, dict[str, str | None]] = {}
 
     tracer.event("audit_start", repository=repo_url, model=getattr(llm, "model", "?"),
                  default_branch=checkout.default_branch, head=checkout.head_commit,
@@ -121,6 +128,43 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
 
     # ---------------------------------------------------------- investigation
     investigate_deadline = started + config.timeout_s * (0.75 if config.verify else 1.0)
+
+    def resolve_observation(args: dict[str, Any]) -> ToolResult:
+        observation_id = str(args["observation_id"]).strip().upper()
+        observations = {o.id: o for o in tools.workflow_observations}
+        if observation_id not in observations:
+            raise ToolError(
+                f"unknown workflow observation '{observation_id}'; call inspect_workflows and use an emitted ID"
+            )
+        observation = observations[observation_id]
+        decision = str(args["decision"]).lower()
+        reason = str(args.get("reason") or "").strip()
+        if len(reason) < 8:
+            raise ToolError("reason is too short; cite the concrete workflow evidence behind the decision")
+        finding_id = args.get("finding_id")
+        if decision == "reported":
+            if not finding_id:
+                raise ToolError("reported requires finding_id for the finding that covers this observation")
+            finding = store.get(str(finding_id))
+            if finding.status not in ("candidate", "kept"):
+                raise ToolError(f"{finding.id} is {finding.status}, so it cannot cover an observation")
+            if finding.file != observation.file:
+                raise ToolError(
+                    f"{finding.id} cites {finding.file or 'the repository'}, but {observation_id} is in "
+                    f"{observation.file}"
+                )
+            finding_id = finding.id
+        elif decision == "dismissed":
+            if finding_id:
+                raise ToolError("dismissed observations must not provide finding_id")
+            finding_id = None
+        else:
+            raise ToolError("decision must be 'reported' or 'dismissed'")
+        observation_resolutions[observation_id] = {
+            "decision": decision, "reason": reason, "finding_id": finding_id,
+        }
+        return ToolResult(f"Resolved {observation_id} as {decision}.")
+
     def finish_investigation(args: dict[str, Any]) -> ToolResult:
         reviewed = {str(area).strip() for area in args.get("areas_reviewed", [])}
         unknown = sorted(reviewed - set(CATEGORIES))
@@ -136,13 +180,26 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
                 "Not finished: use at least one follow-up inspection tool after mapping the repository.",
                 is_error=True,
             )
+        pending_observations = [
+            observation.id for observation in tools.workflow_observations
+            if observation.id not in observation_resolutions
+        ]
+        if pending_observations:
+            return ToolResult(
+                "Not finished: high-risk workflow observations still need resolve_observation: "
+                + ", ".join(pending_observations) + ".",
+                is_error=True,
+            )
         return ToolResult("Investigation finished.", terminal=True)
 
-    inv_schemas = INSPECTION_TOOL_SCHEMAS + [RECORD_VIOLATION_SCHEMA, WITHDRAW_SCHEMA, INVESTIGATION_FINISH_SCHEMA]
+    inv_schemas = INSPECTION_TOOL_SCHEMAS + [
+        RECORD_VIOLATION_SCHEMA, WITHDRAW_SCHEMA, RESOLVE_OBSERVATION_SCHEMA, INVESTIGATION_FINISH_SCHEMA,
+    ]
     inv_handlers = {
         **inspect_handlers,
         "record_violation": store.record,
         "withdraw_violation": store.withdraw,
+        "resolve_observation": resolve_observation,
         "finish": finish_investigation,
     }
     tracer.say(f"[investigate] model={getattr(llm, 'model', '?')} max_steps={config.max_steps}")
@@ -158,16 +215,70 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
 
     # ----------------------------------------------------------- verification
     candidates = store.active()
-    if config.verify and candidates:
+    dismissed_observations = [
+        observation for observation in tools.workflow_observations
+        if observation_resolutions.get(observation.id, {}).get("decision") == "dismissed"
+    ]
+    if config.verify and (candidates or dismissed_observations):
+        def submit_observation_verdict(args: dict[str, Any]) -> ToolResult:
+            observation_id = str(args["observation_id"]).strip().upper()
+            dismissed = {o.id: o for o in dismissed_observations}
+            if observation_id not in dismissed:
+                raise ToolError(f"'{observation_id}' is not a dismissed observation awaiting review")
+            if observation_id in observation_verdicts:
+                raise ToolError(f"{observation_id} already has a verification verdict")
+            decision = str(args["decision"]).lower()
+            reason = str(args.get("reason") or "").strip()
+            if len(reason) < 8:
+                raise ToolError("reason is too short; cite the concrete workflow evidence")
+            finding_id = args.get("finding_id")
+            if decision == "overturn":
+                if not finding_id:
+                    raise ToolError("overturn requires finding_id; record the missed violation first")
+                finding = store.get(str(finding_id))
+                if finding.status not in ("candidate", "kept"):
+                    raise ToolError(f"{finding.id} is {finding.status}, so it cannot support an overturn")
+                if finding.file != dismissed[observation_id].file:
+                    raise ToolError(
+                        f"{finding.id} cites {finding.file or 'the repository'}, but {observation_id} is in "
+                        f"{dismissed[observation_id].file}"
+                    )
+                finding_id = finding.id
+            elif decision == "uphold":
+                if finding_id:
+                    raise ToolError("uphold must not provide finding_id")
+                finding_id = None
+            else:
+                raise ToolError("decision must be 'uphold' or 'overturn'")
+            observation_verdicts[observation_id] = {
+                "decision": decision, "reason": reason, "finding_id": finding_id,
+            }
+            return ToolResult(f"Verification {decision} recorded for {observation_id}.")
+
         def finish_verification(_args: dict[str, Any]) -> ToolResult:
             pending = [f.id for f in store.findings if f.status == "candidate"]
             if pending:
                 return ToolResult(f"Not finished: no verdict yet for {', '.join(pending)}. Submit them, then finish.",
                                   is_error=True)
+            pending_observations = [o.id for o in dismissed_observations if o.id not in observation_verdicts]
+            if pending_observations:
+                return ToolResult(
+                    "Not finished: dismissed workflow observations still need independent verdicts: "
+                    + ", ".join(pending_observations) + ".",
+                    is_error=True,
+                )
             return ToolResult("Verification finished.", terminal=True)
 
-        ver_schemas = INSPECTION_TOOL_SCHEMAS + [VERDICT_SCHEMA, FINISH_SCHEMA]
-        ver_handlers = {**inspect_handlers, "submit_verdict": store.verdict, "finish": finish_verification}
+        ver_schemas = INSPECTION_TOOL_SCHEMAS + [
+            RECORD_VIOLATION_SCHEMA, VERDICT_SCHEMA, OBSERVATION_VERDICT_SCHEMA, FINISH_SCHEMA,
+        ]
+        ver_handlers = {
+            **inspect_handlers,
+            "record_violation": store.record,
+            "submit_verdict": store.verdict,
+            "submit_observation_verdict": submit_observation_verdict,
+            "finish": finish_verification,
+        }
         blocks = []
         for f in candidates:
             blocks.append(
@@ -175,11 +286,26 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
                 f"file={f.file} line={f.line}\ndescription: {f.description}\nevidence: {f.evidence}\n"
                 f"recommendation: {f.recommendation}\ncontext:\n{_context_snippet(tools, f)}"
             )
-        task = (f"Repository: {repo_url} (default branch '{checkout.default_branch}').\n"
-                f"Review these {len(candidates)} candidate finding(s) and submit a verdict for each.\n\n"
-                + "\n\n".join(blocks))
+        observation_blocks = []
+        for observation in dismissed_observations:
+            resolution = observation_resolutions[observation.id]
+            observation_blocks.append(
+                f"### {observation.id}\nkind={observation.kind} suggested_rule={observation.suggested_rule} "
+                f"file={observation.file} line={observation.line}\nsummary: {observation.summary}\n"
+                f"facts: {'; '.join(observation.evidence)}\nguard check: {observation.mitigation}\n"
+                f"investigator dismissal: {resolution['reason']}"
+            )
+        task = (
+            f"Repository: {repo_url} (default branch '{checkout.default_branch}').\n"
+            f"Review {len(candidates)} candidate finding(s) and {len(dismissed_observations)} dismissed "
+            "high-risk workflow observation(s). Submit a verdict for every item.\n\n"
+            + "\n\n".join(blocks + observation_blocks)
+        )
         verify_steps = config.verify_steps
-        tracer.say(f"[verify] reviewing {len(candidates)} candidate(s), max_steps={verify_steps}")
+        tracer.say(
+            f"[verify] reviewing {len(candidates)} candidate(s) and "
+            f"{len(dismissed_observations)} dismissal(s), max_steps={verify_steps}"
+        )
         ver = AgentLoop(llm, VERIFICATION_SYSTEM, ver_schemas, _dispatcher(ver_schemas, ver_handlers), tracer,
                         phase="verify", max_steps=verify_steps, deadline=started + config.timeout_s)
         phases["verify"] = ver.run(task)
@@ -208,5 +334,13 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
         phases={k: {"steps": v.steps, "stop_reason": v.stop_reason} for k, v in phases.items()},
         findings=[{"id": f.id, "rule_id": f.rule_id, "status": f.status, "severity": f.severity,
                    "file": f.file, "line": f.line, "notes": f.notes} for f in store.findings],
+        workflow_observations=[
+            {
+                "id": o.id, "kind": o.kind, "file": o.file, "line": o.line,
+                "investigation": observation_resolutions.get(o.id),
+                "verification": observation_verdicts.get(o.id),
+            }
+            for o in tools.workflow_observations
+        ],
     )
     return AuditResult(report=report, findings=final, phases=phases)

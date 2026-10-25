@@ -170,8 +170,28 @@ class FindingStore:
         if file:
             self._check_evidence(file, line, texts["evidence"])
         for f in self.active():
-            if f.rule_id == rule_id and f.file == file and (f.line == line or line is None or f.line is None):
+            if f.rule_id != rule_id or f.file != file:
+                continue
+            if f.line == line or line is None or f.line is None:
                 raise ToolError(f"duplicate of {f.id} ({f.rule_id} at {f.file or 'repo level'}); not recorded")
+
+            # The same rule recurring in one file is normally one root cause. Preserve the
+            # additional validated evidence without inflating the report with line-by-line copies.
+            def combine(old: str, new: str) -> str:
+                return old if new.lower() in old.lower() else (old.rstrip(". ") + "; " + new)[:1200]
+
+            f.description = combine(f.description, texts["description"])
+            f.evidence = combine(f.evidence, texts["evidence"])
+            f.recommendation = combine(f.recommendation, texts["recommendation"])
+            severity_rank = {name: rank for rank, name in enumerate(reversed(SEVERITIES))}
+            if severity_rank[severity] > severity_rank[f.severity]:
+                f.notes.append(f"severity {f.severity} -> {severity} while grouping another occurrence")
+                f.severity = severity
+            f.notes.append(f"grouped another {rule_id} occurrence at {file}:{line}")
+            return ToolResult(
+                f"Grouped this occurrence into {f.id} because {rule_id} is already reported for {file}.\n"
+                + self.summary()
+            )
 
         finding = Finding(f"V{len(self.findings) + 1}", rule_id, category, severity, file, line, **texts)
         overlap = [f for f in self.active() if file and f.file == file and f.line == line]
@@ -221,8 +241,9 @@ RECORD_VIOLATION_SCHEMA = {
     "description": (
         "Record one confirmed DevOps violation. Only call this after you have observed concrete evidence "
         "with a tool (normally read_file on the exact lines). One call per distinct problem. The harness "
-        "rejects calls whose file does not exist, whose line is out of range, or that duplicate an "
-        "existing finding. Never include secret values - refer to them as <REDACTED> or describe them."
+        "rejects calls whose file does not exist or whose line is out of range. Exact duplicates are rejected; "
+        "additional occurrences of the same rule in one file are grouped into the first finding. Never include "
+        "secret values - refer to them as <REDACTED> or describe them."
     ),
     "input_schema": {
         "type": "object",
@@ -293,5 +314,44 @@ VERDICT_SCHEMA = {
             "line": {"type": "integer"},
         },
         "required": ["finding_id", "decision", "reason"],
+    },
+}
+
+RESOLVE_OBSERVATION_SCHEMA = {
+    "name": "resolve_observation",
+    "description": (
+        "Resolve one high-risk workflow observation emitted by inspect_workflows. Use reported when an active "
+        "finding covers it. Dismiss only when inspection proves the signal is not a defect. A disabling guard "
+        "reduces exploitability but does not automatically make a tracked anti-pattern safe; reflect it in "
+        "severity. Repository documentation and stated intent are not mitigations."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "observation_id": {"type": "string"},
+            "decision": {"type": "string", "enum": ["reported", "dismissed"]},
+            "reason": {"type": "string"},
+            "finding_id": {"type": ["string", "null"]},
+        },
+        "required": ["observation_id", "decision", "reason"],
+    },
+}
+
+OBSERVATION_VERDICT_SCHEMA = {
+    "name": "submit_observation_verdict",
+    "description": (
+        "Review an investigation dismissal. Uphold it only when concrete workflow evidence shows the signal is "
+        "not a defect. Disabled but still unsafe workflow code may warrant a lower-severity finding. To overturn "
+        "a dismissal, first record a finding and provide that finding_id."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "observation_id": {"type": "string"},
+            "decision": {"type": "string", "enum": ["uphold", "overturn"]},
+            "reason": {"type": "string"},
+            "finding_id": {"type": ["string", "null"]},
+        },
+        "required": ["observation_id", "decision", "reason"],
     },
 }

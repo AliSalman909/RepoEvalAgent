@@ -1,5 +1,6 @@
 """Agent-loop behaviour with a scripted LLM: dispatch, error feedback, budgets, termination."""
 
+import re
 import time
 
 import pytest
@@ -10,7 +11,7 @@ from auditor.llm import LLMError
 from auditor.loop import AgentLoop
 from auditor.repo import Checkout
 from auditor.trace import Tracer
-from conftest import FakeLLM, last_tool_results
+from conftest import FakeLLM, last_tool_results, make_repo
 from tools import ToolResult
 
 
@@ -141,7 +142,7 @@ def test_full_audit_llm_driven_tool_selection(defect_repo):
     # verification phase received the candidates with context
     verify_prompt = llm.calls[4]["messages"][0]["content"]
     assert "### V1" in verify_prompt and "### V2" in verify_prompt and ">   3|" in verify_prompt
-    assert "submit_verdict" in llm.calls[4]["tools"] and "record_violation" not in llm.calls[4]["tools"]
+    assert "submit_verdict" in llm.calls[4]["tools"] and "record_violation" in llm.calls[4]["tools"]
 
 
 def test_rejected_finding_is_reported_back_to_model(defect_repo):
@@ -217,3 +218,107 @@ def test_incomplete_verification_raises_instead_of_keeping_undecided(defect_repo
             "u", _checkout(defect_repo), llm, Tracer(None, verbose=False),
             AuditConfig(max_steps=5, verify_steps=1),
         )
+
+
+def test_dismissed_active_workflow_risk_gets_zero_finding_recall_review(tmp_path):
+    repo = make_repo(tmp_path / "active-injection", [("initial", {
+        "README.md": "# Educational example\nThis is intentionally safe.\n",
+        ".github/workflows/injection.yml": """\
+name: Injection demo
+on: issues
+jobs:
+  unsafe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print issue
+        run: echo \"${{ github.event.issue.title }}\"
+""",
+    }, [])])
+    seen: dict[str, str] = {}
+
+    def dismiss_observation(messages):
+        output = "\n".join(result["content"] for result in last_tool_results(messages))
+        seen["id"] = re.search(r"WF-[0-9A-F]{8}", output).group(0)
+        return [
+            ("read_file", {"path": ".github/workflows/injection.yml"}),
+            ("resolve_observation", {
+                "observation_id": seen["id"], "decision": "dismissed",
+                "reason": "The README describes this as an educational example.",
+            }),
+        ]
+
+    def overturn_dismissal(messages):
+        prompt = messages[0]["content"]
+        assert seen["id"] in prompt and "investigator dismissal" in prompt
+        return [
+            ("record_violation", {
+                "rule_id": "SEC-005", "category": "security", "severity": "high",
+                "file": ".github/workflows/injection.yml", "line": 8,
+                "description": "Issue title is interpolated directly into a shell command.",
+                "evidence": "The run step directly expands github.event.issue.title.",
+                "recommendation": "Pass the title through an environment variable and quote it in the shell.",
+            }),
+            ("submit_observation_verdict", {
+                "observation_id": seen["id"], "decision": "overturn", "finding_id": "V1",
+                "reason": "The workflow is active and contains no job-level or step-level false guard.",
+            }),
+        ]
+
+    llm = FakeLLM([
+        [("list_files", {}), ("inspect_workflows", {})],
+        dismiss_observation,
+        [("finish", _audit_finish())],
+        overturn_dismissal,
+        [("submit_verdict", {"finding_id": "V1", "decision": "keep", "reason": "Active injection confirmed"})],
+        [("finish", {"summary": "recall review complete"})],
+    ])
+    result = run_audit(
+        "u", _checkout(repo), llm, Tracer(None, verbose=False),
+        AuditConfig(max_steps=6, verify_steps=5),
+    )
+    assert [v["rule_id"] for v in result.report["violations"]] == ["SEC-005"]
+    assert result.phases["verify"].finished
+
+
+def test_investigation_cannot_finish_with_unresolved_workflow_observation(tmp_path):
+    repo = make_repo(tmp_path / "unresolved", [("initial", {
+        "README.md": "# Demo\n",
+        ".github/workflows/injection.yml": """\
+name: Demo
+on: issues
+jobs:
+  unsafe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo \"${{ github.event.issue.title }}\"
+""",
+    }, [])])
+    observed: dict[str, str] = {}
+
+    def resolve_after_rejection(messages):
+        results = last_tool_results(messages)
+        assert results[0]["is_error"] and "resolve_observation" in results[0]["content"]
+        all_text = "\n".join(
+            result["content"]
+            for call in llm.calls
+            for message in call["messages"]
+            if message.get("role") == "tool"
+            for result in message["results"]
+        )
+        observed["id"] = re.search(r"WF-[0-9A-F]{8}", all_text).group(0)
+        return [("resolve_observation", {
+            "observation_id": observed["id"], "decision": "dismissed",
+            "reason": "Explicitly reviewed for this harness test.",
+        })]
+
+    llm = FakeLLM([
+        [("list_files", {}), ("inspect_workflows", {})],
+        [("finish", _audit_finish())],
+        resolve_after_rejection,
+        [("finish", _audit_finish())],
+    ])
+    result = run_audit(
+        "u", _checkout(repo), llm, Tracer(None, verbose=False),
+        AuditConfig(max_steps=5, verify=False),
+    )
+    assert result.phases["investigate"].finished and result.report["violations"] == []

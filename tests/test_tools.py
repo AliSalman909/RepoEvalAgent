@@ -2,7 +2,7 @@ import shutil
 
 import pytest
 
-from conftest import FAKE_KEY, git
+from conftest import FAKE_KEY, git, make_repo
 from tools import INSPECTION_TOOL_SCHEMAS, RepoTools, ToolError, validate_args
 
 
@@ -81,6 +81,74 @@ def test_inspect_workflows_reports_risky_settings(defect_repo):
 
 def test_inspect_workflows_none(healthy_repo):
     assert "GitHub Actions workflows: 0" in RepoTools(healthy_repo).inspect_workflows()
+
+
+def test_inspect_workflows_emits_structured_active_and_mitigated_risks(tmp_path):
+    repo = make_repo(tmp_path / "workflow-risks", [("initial", {
+        "README.md": "# Workflow fixtures\n",
+        ".github/workflows/active.yml": """\
+name: Active injection
+on: issues
+jobs:
+  unsafe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo \"${{ github.event.issue.title }}\"
+""",
+        ".github/workflows/inert.yml": """\
+name: Inert examples
+on: workflow_dispatch
+jobs:
+  inert:
+    if: ${{ false }}
+    runs-on: ${{ github.event.issue.title }}
+    steps:
+      - run: echo \"::set-output name=x::y\"
+""",
+        ".github/workflows/leaks.yml": """\
+name: Leakage patterns
+on: push
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -ex
+          echo \"${{ secrets.NPM_TOKEN }}\"
+          npm publish --token \"${{ secrets.NPM_TOKEN }}\"
+      - uses: actions/upload-artifact@v4
+        with:
+          path: |
+            .env
+            credentials.json
+""",
+        ".github/workflows/safe.yml": """\
+name: Safe indirection
+on: issues
+jobs:
+  safe:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TITLE: ${{ github.event.issue.title }}
+        run: printf '%s\\n' \"$TITLE\"
+""",
+    }, [])])
+    tools = RepoTools(repo)
+    out = tools.inspect_workflows()
+    observations = tools.workflow_observations
+    kinds_by_file = {(o.file, o.kind) for o in observations}
+    assert (".github/workflows/active.yml", "script_injection") in kinds_by_file
+    assert (".github/workflows/inert.yml", "runner_injection") in kinds_by_file
+    assert (".github/workflows/inert.yml", "deprecated_command") in kinds_by_file
+    assert (".github/workflows/leaks.yml", "shell_trace") in kinds_by_file
+    assert (".github/workflows/leaks.yml", "secret_log") in kinds_by_file
+    assert (".github/workflows/leaks.yml", "secret_cli") in kinds_by_file
+    assert (".github/workflows/leaks.yml", "sensitive_artifact") in kinds_by_file
+    assert not any(o.file.endswith("safe.yml") and o.kind == "script_injection" for o in observations)
+    assert "HIGH-RISK OBSERVATIONS" in out and "must be resolved before finish" in out
+    inert = [o for o in observations if o.file.endswith("inert.yml")]
+    assert inert and all("if: false guard" in o.mitigation for o in inert)
 
 
 def test_check_gitignore(defect_repo, healthy_repo):

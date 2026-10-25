@@ -76,6 +76,20 @@ def test_duplicates_rejected(store):
         store.record(_finding())
 
 
+def test_same_rule_in_one_file_is_grouped_as_one_root_cause(store):
+    store.record(_finding())
+    result = store.record(_finding(
+        line=4,
+        description="Another hardcoded configuration credential in config.py",
+        evidence="DB_HOST has another literal credential-like configuration value",
+        recommendation="Move all credentials in this file into managed environment configuration.",
+    ))
+    assert "Grouped this occurrence into V1" in result.content
+    assert len(store.active()) == 1
+    assert "Another hardcoded" in store.active()[0].description
+    assert "grouped another SEC-001 occurrence" in store.active()[0].notes[-1]
+
+
 def test_secret_values_are_redacted_from_fields(store):
     store.record(_finding(evidence=f"The key {FAKE_KEY} is hardcoded on line 3"))
     assert FAKE_KEY not in store.active()[0].evidence

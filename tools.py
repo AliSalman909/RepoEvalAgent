@@ -11,6 +11,7 @@ Tools exposed to the agent:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -52,6 +53,20 @@ class ToolError(Exception):
     """A user-facing tool failure: reported to the LLM as an error result."""
 
 
+@dataclass(frozen=True)
+class WorkflowObservation:
+    """A high-risk workflow fact that the agent must explicitly resolve."""
+
+    id: str
+    file: str
+    line: int
+    kind: str
+    suggested_rule: str
+    summary: str
+    evidence: tuple[str, ...]
+    mitigation: str
+
+
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
@@ -71,6 +86,7 @@ class RepoTools:
             raise ValueError(f"repository root does not exist: {self.root}")
         self._tracked: list[str] | None = None
         self._pcre: bool | None = None
+        self._workflow_observations: dict[str, WorkflowObservation] = {}
 
     # ------------------------------------------------------------------ helpers
 
@@ -299,6 +315,7 @@ class RepoTools:
         (r"continue-on-error:\s*true", "continue-on-error: true"),
         (r"\|\|\s*(true|exit 0|:)\b", "failure suppressed with '|| true' or similar"),
         (r"\bset \+e\b", "set +e (errors ignored)"),
+        (r"\bset\s+-[^\n]*x", "shell xtrace enabled (commands and expanded values are logged)"),
         (r"if:\s*(false|\$\{\{\s*false\s*\}\})", "step/job disabled with if: false"),
         (r"\$\{\{\s*github\.(event\.(issue|pull_request|comment|review|head_commit|commits|pages)|head_ref)", "untrusted github context expression"),
         (r"github\.event\.pull_request\.head\.(sha|ref)|refs/pull/", "checks out pull-request head code"),
@@ -324,6 +341,139 @@ class RepoTools:
             return f"version tag {ref}"
         return f"mutable ref '{ref}' (branch or non-version tag)"
 
+    @property
+    def workflow_observations(self) -> list[WorkflowObservation]:
+        return sorted(self._workflow_observations.values(), key=lambda o: (o.file, o.line, o.kind))
+
+    @staticmethod
+    def _workflow_guard(lines: list[str], line_number: int) -> str:
+        """Describe concrete disabling guards around a workflow line, without assuming intent."""
+        index = max(0, line_number - 1)
+        job_start = 0
+        for i in range(index, -1, -1):
+            if re.match(r"^  [A-Za-z0-9_.-]+:\s*(?:#.*)?$", lines[i]):
+                job_start = i
+                break
+        job_end = len(lines)
+        for i in range(job_start + 1, len(lines)):
+            if re.match(r"^  [A-Za-z0-9_.-]+:\s*(?:#.*)?$", lines[i]):
+                job_end = i
+                break
+        job_header = lines[job_start:index + 1]
+        steps_at = next((i for i, text in enumerate(job_header) if re.match(r"^    steps:\s*$", text)), len(job_header))
+        if any(re.search(r"^    if:\s*(?:\$\{\{\s*)?false(?:\s*\}\})?\s*(?:#.*)?$", text, re.I)
+               for text in job_header[:steps_at]):
+            return "job has an explicit if: false guard"
+
+        step_start = None
+        for i in range(index, job_start, -1):
+            if re.match(r"^      -\s+", lines[i]):
+                step_start = i
+                break
+        if step_start is not None:
+            step_end = min(job_end, next(
+                (i for i in range(step_start + 1, job_end) if re.match(r"^      -\s+", lines[i])),
+                job_end,
+            ))
+            if any(re.search(r"^        if:\s*(?:\$\{\{\s*)?false(?:\s*\}\})?\s*(?:#.*)?$", text, re.I)
+                   for text in lines[step_start:step_end]):
+                return "step has an explicit if: false guard"
+        return "no explicit if: false guard was found around this line"
+
+    def _scan_workflow_observations(self, file: str, raw: str) -> list[WorkflowObservation]:
+        """Extract high-signal facts. These are review leads, never automatic violations."""
+        lines = raw.splitlines()
+        grouped: dict[str, list[tuple[int, str]]] = defaultdict(list)
+
+        run_block_indent: int | None = None
+        for n, line in enumerate(lines, 1):
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip())
+            if run_block_indent is not None and stripped and indent <= run_block_indent:
+                run_block_indent = None
+            in_run = bool(re.match(r"^\s*-?\s*run:\s*", line)) or run_block_indent is not None
+            if re.match(r"^\s*-?\s*run:\s*[>|]\s*(?:#.*)?$", line):
+                run_block_indent = indent
+                in_run = True
+
+            untrusted = re.search(
+                r"\$\{\{\s*(?:github\.(?:event\.(?:issue|pull_request|comment|review|head_commit|commits|pages)|head_ref)|inputs\.)",
+                line,
+            )
+            if in_run and untrusted:
+                grouped["script_injection"].append((n, "untrusted event/input expression is interpolated directly into a shell script"))
+            if re.search(r"^\s*runs-on:\s*.*\$\{\{.*(?:github\.event\.|inputs\.)", line):
+                grouped["runner_injection"].append((n, "event input controls the runner label"))
+            if in_run and re.search(r"(?:^|[;&|]\s*)set\s+-[A-Za-z]*x[A-Za-z]*\b", stripped):
+                grouped["shell_trace"].append((n, "shell xtrace is enabled and can log expanded secret values"))
+            if in_run and re.search(r"\b(?:echo|printf|printenv)\b", line, re.I) and re.search(
+                r"(?:\$\{\{\s*secrets\.|\$(?:\{)?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*(?:\})?)",
+                line,
+                re.I,
+            ):
+                grouped["secret_log"].append((n, "a secret expression or secret-named variable is printed to the job log"))
+            if in_run and re.search(r"\bcurl\b[^\n]*(?:\s-v\b|--verbose\b)", line) and re.search(
+                r"authorization|bearer|token|secret|password", "\n".join(lines[max(0, n - 3):min(len(lines), n + 2)]), re.I
+            ):
+                grouped["secret_log"].append((n, "verbose curl is used near an authorization credential"))
+            if in_run and (
+                re.search(r"\bnpm\s+publish\b[^\n]*(?:--token|--_authToken)\b", line, re.I)
+                or re.search(r"\bdocker\s+login\b[^\n]*(?:-p\b|--password\b)", line, re.I)
+                or re.search(r"\btwine\s+upload\b[^\n]*--password\b", line, re.I)
+            ):
+                grouped["secret_cli"].append((n, "a credential is supplied through a command-line argument"))
+            if "::set-output" in line:
+                grouped["deprecated_command"].append((n, "deprecated ::set-output workflow command is emitted"))
+            if re.search(r"contains\s*\([^\n]*github\.actor", line, re.I):
+                grouped["actor_allowlist"].append((n, "substring matching is used as an actor authorization gate"))
+
+        # Inspect upload-artifact step bodies for sensitive paths.
+        for i, line in enumerate(lines):
+            if not re.search(r"uses:\s*actions/upload-artifact@", line, re.I):
+                continue
+            indent = len(line) - len(line.lstrip())
+            end = next((j for j in range(i + 1, len(lines))
+                        if lines[j].strip() and len(lines[j]) - len(lines[j].lstrip()) < indent), len(lines))
+            block = "\n".join(lines[i:end])
+            if re.search(r"(?:^|[/\\])\.env(?:\.|$)|credentials?(?:\.json)?|\.ssh|id_rsa|private[_-]?key|\.pem\b", block, re.I | re.M):
+                grouped["sensitive_artifact"].append((i + 1, "upload-artifact includes credential, environment, SSH, or private-key paths"))
+
+        # Multiple downloads writing the same basename can silently overwrite one another.
+        destinations: dict[str, list[int]] = defaultdict(list)
+        for n, line in enumerate(lines, 1):
+            match = re.search(r"\b(?:curl\b[^\n]*\s-o|wget\b[^\n]*(?:\s-O)?)\s+['\"]?([^\s'\"]+)", line)
+            if match:
+                destinations[PurePosixPath(match.group(1)).name].append(n)
+        for name, positions in destinations.items():
+            if name and len(positions) > 1:
+                grouped["download_collision"].append((positions[0], f"multiple downloads write the same filename {name!r}"))
+
+        meta = {
+            "script_injection": ("SEC-005", "Possible shell-script injection"),
+            "runner_injection": ("SEC-012", "Possible attacker-controlled runner selection"),
+            "shell_trace": ("SEC-009", "Shell tracing near credential use"),
+            "secret_log": ("SEC-006", "Possible credential exposure in CI logs"),
+            "secret_cli": ("SEC-010", "Credential passed through process arguments"),
+            "sensitive_artifact": ("SEC-011", "Sensitive files included in a workflow artifact"),
+            "deprecated_command": ("CI-006", "Deprecated workflow command"),
+            "actor_allowlist": ("COL-003", "Potentially bypassable actor allowlist"),
+            "download_collision": ("CI-007", "Workflow download filename collision"),
+        }
+        observations: list[WorkflowObservation] = []
+        for kind, facts in grouped.items():
+            rule, summary = meta[kind]
+            facts = sorted(set(facts))
+            first_line = facts[0][0]
+            digest = hashlib.sha1(f"{file}\0{kind}".encode()).hexdigest()[:8].upper()
+            guards = {self._workflow_guard(lines, line_no) for line_no, _ in facts}
+            observations.append(WorkflowObservation(
+                id=f"WF-{digest}", file=file, line=first_line, kind=kind, suggested_rule=rule,
+                summary=summary,
+                evidence=tuple(f"line {line_no}: {detail}" for line_no, detail in facts),
+                mitigation="; ".join(sorted(guards)),
+            ))
+        return observations
+
     def inspect_workflows(self, path: str = "") -> str:
         files = self.tracked_files()
         wf = [f for f in files if re.match(r"\.github/workflows/[^/]+\.ya?ml$", f)]
@@ -342,6 +492,8 @@ class RepoTools:
 
         for f in wf:
             raw = (self.root / f).read_text("utf-8", "replace")
+            for observation in self._scan_workflow_observations(f, raw):
+                self._workflow_observations[observation.id] = observation
             out.append(f"\n=== {f} ===")
             try:
                 doc = yaml.safe_load(raw)
@@ -391,6 +543,19 @@ class RepoTools:
             if notable:
                 out.append("notable lines (facts to verify, not conclusions):")
                 out.extend(notable[:40])
+        selected = [o for o in self.workflow_observations if not path or o.file == norm]
+        if selected:
+            out.append("\nHIGH-RISK OBSERVATIONS (each ID must be resolved before finish):")
+            for observation in selected:
+                out.append(
+                    f"- {observation.id} [{observation.kind}; suggested {observation.suggested_rule}] "
+                    f"{observation.file}:{observation.line} - {observation.summary}. "
+                    f"Facts: {'; '.join(observation.evidence)}. Guard check: {observation.mitigation}."
+                )
+            out.append(
+                "Read the cited lines, then call resolve_observation for every ID. Documentation claiming a "
+                "workflow is safe or intentional does not resolve an executable anti-pattern."
+            )
         return _truncate(redact("\n".join(out)))
 
     # --------------------------------------------------------- check_gitignore
@@ -534,10 +699,11 @@ INSPECTION_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "inspect_workflows",
         "description": (
             "Parse GitHub Actions workflows: triggers, permissions, jobs, steps, action ref pinning, and "
-            "line-numbered notable lines (pull_request_target, write permissions, continue-on-error, "
-            "'|| true', untrusted ${{ github.event.* }} in run, etc.). Also reports other CI systems, "
-            "Dependabot/Renovate, CODEOWNERS and pre-commit configs. Notable lines are facts to verify, "
-            "not conclusions."
+            "line-numbered notable lines. Emits stable HIGH-RISK OBSERVATION IDs for event-to-shell injection, "
+            "input-controlled runners, shell tracing, credential logging/CLI arguments, sensitive artifacts, "
+            "deprecated commands, actor gates, and download collisions. Each observation is a fact to inspect "
+            "and must be resolved explicitly; it is not automatically a violation. Also reports other CI systems, "
+            "Dependabot/Renovate, CODEOWNERS and pre-commit configs."
         ),
         "input_schema": {
             "type": "object",
