@@ -123,6 +123,7 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
     observation_verdicts: dict[str, dict[str, str | None]] = {}
 
     tracer.event("audit_start", repository=repo_url, model=getattr(llm, "model", "?"),
+                 temperature=getattr(llm, "temperature", None),
                  default_branch=checkout.default_branch, head=checkout.head_commit,
                  tracked_files=len(tools.tracked_files()))
 
@@ -236,7 +237,11 @@ def run_audit(repo_url: str, checkout: Checkout, llm: LLMClient, tracer: Tracer,
         "resolve_observation": resolve_observation,
         "finish": finish_investigation,
     }
-    tracer.say(f"[investigate] model={getattr(llm, 'model', '?')} max_steps={config.max_steps}")
+    temperature = getattr(llm, "temperature", None)
+    tracer.say(
+        f"[investigate] model={getattr(llm, 'model', '?')} "
+        f"temperature={temperature if temperature is not None else 'model-default'} max_steps={config.max_steps}"
+    )
     inv = AgentLoop(llm, INVESTIGATION_SYSTEM, inv_schemas, _dispatcher(inv_schemas, inv_handlers), tracer,
                     phase="investigate", max_steps=config.max_steps, deadline=investigate_deadline)
     phases["investigate"] = inv.run(_overview(tools, checkout, repo_url))

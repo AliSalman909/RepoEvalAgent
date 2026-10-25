@@ -9,6 +9,11 @@ from tools import INSPECTION_TOOL_SCHEMAS
 TEST_MODEL = "test-model-from-env"
 
 
+@pytest.fixture(autouse=True)
+def clear_temperature(monkeypatch):
+    monkeypatch.delenv("GEMINI_TEMPERATURE", raising=False)
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-real")
@@ -26,10 +31,24 @@ def _response(parts, finish="STOP"):
 
 
 def test_model_and_thinking_come_from_env(monkeypatch, client):
-    assert client.model == TEST_MODEL and client.thinking_level is None  # nothing hardcoded
+    assert client.model == TEST_MODEL and client.thinking_level is None and client.temperature is None
     monkeypatch.setenv("GEMINI_THINKING_LEVEL", "High")
     assert GeminiClient().thinking_level == "high"
     assert GeminiClient(model="cli-model").model == "cli-model"  # --model overrides the env
+
+
+def test_temperature_comes_from_env_and_constructor_overrides(monkeypatch, client):
+    monkeypatch.setenv("GEMINI_TEMPERATURE", "0.1")
+    assert GeminiClient().temperature == 0.1
+    assert GeminiClient(temperature=0.2).temperature == 0.2
+
+
+@pytest.mark.parametrize("value", ["nope", "-0.1", "2.1", "nan", "inf"])
+def test_invalid_temperature_is_a_config_error(monkeypatch, value):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_TEMPERATURE", value)
+    with pytest.raises(LLMConfigError, match="GEMINI_TEMPERATURE"):
+        GeminiClient()
 
 
 def test_missing_key(monkeypatch, client):
@@ -176,6 +195,17 @@ def test_complete_sends_expected_request(client, monkeypatch):
     assert cfg.system_instruction == "system prompt"
     assert cfg.automatic_function_calling.disable is True   # we own the loop
     assert cfg.thinking_config is None                      # not sent unless GEMINI_THINKING_LEVEL is set
+    assert cfg.temperature is None                          # model default unless GEMINI_TEMPERATURE is set
+
+
+def test_temperature_sent_when_configured(monkeypatch, client):
+    monkeypatch.setenv("GEMINI_TEMPERATURE", "0.1")
+    c = GeminiClient()
+    seen = {}
+    monkeypatch.setattr(c._client.models, "generate_content",
+                        lambda **kw: seen.update(kw) or _response([types.Part(text="ok")]))
+    c.complete("s", [{"role": "user", "content": "hi"}], INSPECTION_TOOL_SCHEMAS)
+    assert seen["config"].temperature == 0.1
 
 
 def test_thinking_level_sent_when_configured(monkeypatch, client):

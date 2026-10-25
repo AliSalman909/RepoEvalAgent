@@ -79,6 +79,7 @@ class GeminiClient:
         self,
         model: str | None = None,
         thinking_level: str | None = None,
+        temperature: float | None = None,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         timeout_s: float = 300.0,
         retry_attempts: int = 5,
@@ -115,6 +116,18 @@ class GeminiClient:
         # Thinking level is model-specific (some models reject some levels), so it is only sent when configured.
         level = thinking_level if thinking_level is not None else os.environ.get("GEMINI_THINKING_LEVEL", "")
         self.thinking_level = level.strip().lower() or None
+        raw_temperature: float | str | None = temperature
+        if raw_temperature is None:
+            raw_temperature = os.environ.get("GEMINI_TEMPERATURE", "").strip() or None
+        if raw_temperature is None:
+            self.temperature = None
+        else:
+            try:
+                self.temperature = float(raw_temperature)
+            except (TypeError, ValueError):
+                raise LLMConfigError("GEMINI_TEMPERATURE must be a number from 0.0 to 2.0") from None
+            if not math.isfinite(self.temperature) or not 0.0 <= self.temperature <= 2.0:
+                raise LLMConfigError("GEMINI_TEMPERATURE must be from 0.0 to 2.0")
         self.max_output_tokens = max_output_tokens
         http_options = types.HttpOptions(
             timeout=int(timeout_s * 1000),  # milliseconds
@@ -226,6 +239,7 @@ class GeminiClient:
             # We run the loop ourselves: never let the SDK call Python functions on its own.
             automatic_function_calling=t.AutomaticFunctionCallingConfig(disable=True),
             max_output_tokens=self.max_output_tokens,
+            temperature=self.temperature,
             thinking_config=t.ThinkingConfig(thinking_level=self.thinking_level) if self.thinking_level else None,
         )
         try:

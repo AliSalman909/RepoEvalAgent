@@ -132,7 +132,10 @@ def main(argv: list[str] | None = None) -> int:
         except AuditIncompleteError as exc:
             return _fail(EXIT_INCOMPLETE, str(exc))
         except LLMConfigError as exc:
-            return _fail(EXIT_LLM_CONFIG, f"{exc}. Check GEMINI_API_KEY, GEMINI_MODEL, and the request limit.")
+            return _fail(
+                EXIT_LLM_CONFIG,
+                f"{exc}. Check GEMINI_API_KEY, GEMINI_MODEL, GEMINI_TEMPERATURE, and the request limit.",
+            )
         except LLMError as exc:
             return _fail(EXIT_LLM, f"LLM failure, inspection incomplete, no report written: {exc}")
         try:

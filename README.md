@@ -73,6 +73,7 @@ default. It deliberately contains no real credential. Copy it to `.env`, then ad
 GEMINI_API_KEY=replace-with-your-key
 GEMINI_MODEL=gemini-flash-lite-latest
 GEMINI_REQUESTS_PER_MINUTE=10
+# GEMINI_TEMPERATURE=0.1
 ```
 
 The agent loads `.env` automatically through `python-dotenv`; there is no need to export or source it manually.
@@ -87,11 +88,22 @@ If `.env` already exists, edit it directly instead of copying `.env.example` ove
 | `GEMINI_API_KEY` | yes | - | Private Gemini API key. `GOOGLE_API_KEY` is also accepted |
 | `GEMINI_MODEL` | no | `gemini-flash-lite-latest` | Gemini model used for the audit; `--model` overrides it for one run |
 | `GEMINI_REQUESTS_PER_MINUTE` | no | `10` | Maximum top-level Gemini calls per minute; calls are evenly spaced to avoid bursts |
+| `GEMINI_TEMPERATURE` | no | model default | Sampling randomness from `0.0` to `2.0`; `0.1` is a low setting. Newer Gemini 3 models may ignore custom sampling values |
 | `GEMINI_THINKING_LEVEL` | no | unset | `minimal` / `low` / `medium` / `high`; only sent when set. Supported levels differ per model (e.g. `gemini-3.8-flash` rejects `minimal`) |
 | `AGENT_MAX_STEPS` | no | `45` | Investigation turn budget |
 | `AGENT_TIMEOUT` | no | `1800` | Overall wall-clock budget (seconds) |
 
 Shell environment variables are also supported and take precedence over values loaded from `.env`.
+
+For a low temperature, add this to `.env`:
+
+```dotenv
+GEMINI_TEMPERATURE=0.1
+```
+
+The startup line and JSONL trace show the applied value. Leave it unset to use the model default. Temperature support
+is model-specific: newer Gemini 3 models may ignore custom sampling values, and `latest` aliases can change the model
+version they reference.
 
 ## 3. Running
 
@@ -149,7 +161,7 @@ included for the assignment submission; users do not need to regenerate it.
 
 - `error: no Gemini API key found`: add the key to `.env` after `GEMINI_API_KEY=`.
 - Exit code 3: confirm the repository URL is correct and publicly accessible.
-- Exit code 4: check the API key, model name, and that `GEMINI_REQUESTS_PER_MINUTE` is a positive number.
+- Exit code 4: check the API key, model name, request limit, and optional temperature value.
 - A run may take several minutes because the default request limiter permits 10 Gemini calls per minute. Increase the
   value only if the API account's quota supports it.
 
