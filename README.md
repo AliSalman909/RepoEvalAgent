@@ -110,7 +110,10 @@ Outputs:
 - `report.trace.jsonl` is a full trace of every LLM turn, tool call (name, arguments, result preview, duration),
   finding and verdict, so you can check the agent's behaviour. Secrets are redacted.
 
-Other options:
+### Optional command-line settings
+
+These are advanced command-line options, not `.env` entries. They are not needed for a normal audit; most users only
+need `--repo` and `--output` as shown above.
 
 | Option | Meaning |
 |---|---|
@@ -123,20 +126,24 @@ Other options:
 | `--keep-clone` | Keep the temporary clone for debugging |
 | `-q` | Quiet: only errors and the final summary |
 
-`--repo` also accepts a path to a local git repository, which is useful for offline testing. Local repos are cloned
-too, so the original is never touched.
+For offline testing, `--repo` may also be the path to a local Git repository. The agent audits a temporary clone, so
+the original repository is not modified.
 
-### Generate the required sample report
+### Generate a report
 
-After configuring the API key, create an authentic sample by running the real agent against a public repository:
+After adding the API key to `.env`, replace the URL below with the public GitHub repository you want to audit:
 
-```bash
-python agent.py --repo https://github.com/owner/repository --output sample_report.json
+```powershell
+python agent.py --repo https://github.com/pypa/sampleproject --output sampleproject-report.json
 ```
 
-Review the result, then commit `sample_report.json` with the submission. Do not substitute a manually written JSON
-file. The generated `sample_report.trace.jsonl` is useful for debugging but is ignored by Git and does not need to be
-submitted.
+The command creates:
+
+- `sampleproject-report.json` — the final audit report.
+- `sampleproject-report.trace.jsonl` — a detailed execution trace useful for debugging.
+
+You can choose any output filename. The committed `sample_report.json` in this project is an authentic example output
+included for the assignment submission; users do not need to regenerate it.
 
 ### Common setup problems
 
